@@ -134,6 +134,7 @@ pub mod core;
 pub mod exec;
 pub mod execpolicy;
 pub mod gemini;
+pub mod http_client;
 pub mod instructions;
 pub mod llm;
 pub mod mcp_client;
@@ -146,9 +147,9 @@ pub mod tool_policy;
 pub mod tools;
 pub mod types;
 pub mod ui;
-pub mod update;
 pub mod utils;
 
+// New MCP enhancement modules
 // Re-exports for convenience
 pub use bash_runner::BashRunner;
 pub use cli::args::{Cli, Commands};
@@ -172,7 +173,6 @@ pub use core::context_compression::{
     CompressedContext, ContextCompressionConfig, ContextCompressor,
 };
 pub use core::conversation_summarizer::ConversationSummarizer;
-pub use core::performance_profiler::PerformanceProfiler;
 pub use core::prompt_caching::{CacheStats, PromptCache, PromptCacheConfig, PromptOptimizer};
 pub use core::timeout_detector::TimeoutDetector;
 pub use exec::events::{
@@ -184,6 +184,7 @@ pub use exec::events::{
 };
 pub use gemini::{Content, FunctionDeclaration, Part};
 pub use llm::{AnyClient, make_client};
+pub use mcp_client::validate_mcp_config;
 pub use prompts::{
     generate_lightweight_instruction, generate_specialized_instruction, generate_system_instruction,
 };
@@ -196,9 +197,6 @@ pub use tools::{
     build_function_declarations_for_level, build_function_declarations_with_mode,
 };
 pub use ui::diff_renderer::DiffRenderer;
-pub use update::{
-    UpdateChannel, UpdateConfig, UpdateFrequency, UpdateManager, UpdateResult, UpdateStatus,
-};
 pub use utils::dot_config::{
     CacheConfig, DotConfig, DotManager, ProviderConfigs, UiConfig, UserPreferences,
     WorkspaceTrustRecord, WorkspaceTrustStore, initialize_dot_folder, load_user_config,

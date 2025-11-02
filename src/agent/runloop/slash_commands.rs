@@ -33,6 +33,8 @@ pub enum SlashCommandOutcome {
 
     ShowConfig,
     Exit,
+    NewSession,
+    OpenDocs,
     StartModelSelection,
     StartThemePalette {
         mode: ThemePaletteMode,
@@ -57,19 +59,9 @@ pub enum SlashCommandOutcome {
     ManageSandbox {
         action: SandboxAction,
     },
-    CheckForUpdates {
-        action: UpdateAction,
-    },
     SubmitPrompt {
         prompt: String,
     },
-}
-
-#[derive(Clone, Debug)]
-pub enum UpdateAction {
-    Check,
-    Install,
-    Status,
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +70,10 @@ pub enum McpCommandAction {
     ListProviders,
     ListTools,
     RefreshTools,
+    ShowConfig,
+    EditConfig,
+    Repair,
+    Diagnose,
     Login(String),
     Logout(String),
 }
@@ -240,7 +236,7 @@ pub async fn handle_slash_command(
             let mut args_map = Map::new();
             args_map.insert("command".to_string(), Value::Array(command_vec));
             Ok(SlashCommandOutcome::ExecuteTool {
-                name: "run_terminal_cmd".to_string(),
+                name: "run_command".to_string(),
                 args: Value::Object(args_map),
             })
         }
@@ -335,6 +331,46 @@ pub async fn handle_slash_command(
                 }),
                 "refresh" | "reload" => Ok(SlashCommandOutcome::ManageMcp {
                     action: McpCommandAction::RefreshTools,
+                }),
+                "config" => {
+                    if tokens.len() > 1 {
+                        let mode = tokens[1].to_ascii_lowercase();
+                        match mode.as_str() {
+                            "edit" | "--edit" => Ok(SlashCommandOutcome::ManageMcp {
+                                action: McpCommandAction::EditConfig,
+                            }),
+                            "show" | "list" | "status" => Ok(SlashCommandOutcome::ManageMcp {
+                                action: McpCommandAction::ShowConfig,
+                            }),
+                            other if other.starts_with("--") => {
+                                if other == "--edit" {
+                                    Ok(SlashCommandOutcome::ManageMcp {
+                                        action: McpCommandAction::EditConfig,
+                                    })
+                                } else {
+                                    render_mcp_usage(renderer)?;
+                                    Ok(SlashCommandOutcome::Handled)
+                                }
+                            }
+                            _ => {
+                                render_mcp_usage(renderer)?;
+                                Ok(SlashCommandOutcome::Handled)
+                            }
+                        }
+                    } else {
+                        Ok(SlashCommandOutcome::ManageMcp {
+                            action: McpCommandAction::ShowConfig,
+                        })
+                    }
+                }
+                "edit" => Ok(SlashCommandOutcome::ManageMcp {
+                    action: McpCommandAction::EditConfig,
+                }),
+                "repair" | "fix" => Ok(SlashCommandOutcome::ManageMcp {
+                    action: McpCommandAction::Repair,
+                }),
+                "diagnose" | "diagnostics" | "health" => Ok(SlashCommandOutcome::ManageMcp {
+                    action: McpCommandAction::Diagnose,
                 }),
                 "login" => {
                     if tokens.len() < 2 {
@@ -519,22 +555,19 @@ pub async fn handle_slash_command(
             }
             Ok(SlashCommandOutcome::Handled)
         }
-        "update" => {
-            let action = if args.is_empty() {
-                UpdateAction::Check
-            } else {
-                match args.trim().to_ascii_lowercase().as_str() {
-                    "check" => UpdateAction::Check,
-                    "install" => UpdateAction::Install,
-                    "status" => UpdateAction::Status,
-                    _ => {
-                        renderer
-                            .line(MessageStyle::Error, "Usage: /update [check|install|status]")?;
-                        return Ok(SlashCommandOutcome::Handled);
-                    }
-                }
-            };
-            Ok(SlashCommandOutcome::CheckForUpdates { action })
+        "new" => {
+            if !args.is_empty() {
+                renderer.line(MessageStyle::Error, "Usage: /new")?;
+                return Ok(SlashCommandOutcome::Handled);
+            }
+            Ok(SlashCommandOutcome::NewSession)
+        }
+        "docs" => {
+            if !args.is_empty() {
+                renderer.line(MessageStyle::Error, "Usage: /docs")?;
+                return Ok(SlashCommandOutcome::Handled);
+            }
+            Ok(SlashCommandOutcome::OpenDocs)
         }
         "exit" => Ok(SlashCommandOutcome::Exit),
         _ => {
@@ -745,7 +778,7 @@ fn split_command_and_args(input: &str) -> (&str, &str) {
 fn render_mcp_usage(renderer: &mut AnsiRenderer) -> Result<()> {
     renderer.line(
         MessageStyle::Info,
-        "Usage: /mcp [status|list|tools|refresh|login <name>|logout <name>]",
+        "Usage: /mcp [status|list|tools|refresh|config|config edit|repair|diagnose|login <name>|logout <name>]",
     )?;
     renderer.line(
         MessageStyle::Info,
@@ -762,6 +795,22 @@ fn render_mcp_usage(renderer: &mut AnsiRenderer) -> Result<()> {
     renderer.line(
         MessageStyle::Info,
         "  refresh – Reindex MCP tools without restarting",
+    )?;
+    renderer.line(
+        MessageStyle::Info,
+        "  config  – Summarize MCP settings from vtcode.toml",
+    )?;
+    renderer.line(
+        MessageStyle::Info,
+        "  config edit – Show the config file path and editing guidance",
+    )?;
+    renderer.line(
+        MessageStyle::Info,
+        "  repair  – Restart MCP connections and refresh tool indices",
+    )?;
+    renderer.line(
+        MessageStyle::Info,
+        "  diagnose – Validate config and run MCP health checks",
     )?;
     renderer.line(
         MessageStyle::Info,

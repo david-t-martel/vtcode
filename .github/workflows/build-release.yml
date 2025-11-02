@@ -38,6 +38,26 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Install x86_64 OpenSSL
+        if: matrix.target == 'x86_64-apple-darwin'
+        shell: bash
+        env:
+          NONINTERACTIVE: 1
+        run: |
+          sudo softwareupdate --install-rosetta --agree-to-license || true
+          /usr/bin/arch -x86_64 /bin/bash -lc '
+            if [[ ! -x /usr/local/bin/brew ]]; then
+              /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+            fi
+            /usr/local/bin/brew update
+            /usr/local/bin/brew install openssl@3
+          '
+          OPENSSL_DIR=$(/usr/bin/arch -x86_64 /usr/local/bin/brew --prefix openssl@3)
+          echo "OPENSSL_DIR=$OPENSSL_DIR" >> "$GITHUB_ENV"
+          echo "OPENSSL_INCLUDE_DIR=$OPENSSL_DIR/include" >> "$GITHUB_ENV"
+          echo "OPENSSL_LIB_DIR=$OPENSSL_DIR/lib" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$OPENSSL_DIR/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
@@ -45,20 +65,18 @@ jobs:
         if: matrix.os != 'windows-latest'
         run: |
           cd target/${{ matrix.target }}/release
-          tar -czf ../../../vtcode-v${{ github.event.release.tag_name }}-${{ matrix.name }}.tar.gz vtcode
+          tar -czf ../../../vtcode-${{ matrix.name }}.tar.gz vtcode
 
       - name: Package binary (Windows)
         if: matrix.os == 'windows-latest'
         run: |
           cd target/${{ matrix.target }}/release
-          7z a ../../../vtcode-v${{ github.event.release.tag_name }}-${{ matrix.name }}.zip vtcode.exe
+          7z a ../../../vtcode-${{ matrix.name }}.zip vtcode.exe
 
       - name: Upload binary
-        uses: actions/upload-release-asset@v1
+        uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: ./vtcode-v${{ github.event.release.tag_name }}-${{ matrix.name }}.${{ matrix.os == 'windows-latest' && 'zip' || 'tar.gz' }}
-          asset_name: vtcode-v${{ github.event.release.tag_name }}-${{ matrix.name }}.${{ matrix.os == 'windows-latest' && 'zip' || 'tar.gz' }}
-          asset_content_type: application/${{ matrix.os == 'windows-latest' && 'zip' || 'gzip' }}
+          files: vtcode-${{ matrix.name }}.${{ matrix.os == 'windows-latest' && 'zip' || 'tar.gz' }}
+          fail_on_unmatched_files: true

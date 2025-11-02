@@ -5,14 +5,17 @@ use futures::future::BoxFuture;
 use portable_pty::PtySize;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use shell_words::split;
+use shell_words::{join, split};
 use std::{
     borrow::Cow,
+    env,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 use tokio::time::sleep;
+use vte::{Parser, Perform};
 
+use crate::config::PtyConfig;
 use crate::tools::apply_patch::Patch;
 use crate::tools::grep_file::GrepSearchInput;
 use crate::tools::traits::Tool;
@@ -88,6 +91,30 @@ impl ToolRegistry {
                 context_lines: Option<usize>,
                 #[serde(default)]
                 include_hidden: Option<bool>,
+                #[serde(default)]
+                respect_ignore_files: Option<bool>,
+                #[serde(default)]
+                max_file_size: Option<usize>,
+                #[serde(default)]
+                search_hidden: Option<bool>,
+                #[serde(default)]
+                search_binary: Option<bool>,
+                #[serde(default)]
+                files_with_matches: Option<bool>,
+                #[serde(default)]
+                type_pattern: Option<String>,
+                #[serde(default)]
+                invert_match: Option<bool>,
+                #[serde(default)]
+                word_boundaries: Option<bool>,
+                #[serde(default)]
+                line_number: Option<bool>,
+                #[serde(default)]
+                column: Option<bool>,
+                #[serde(default)]
+                only_matching: Option<bool>,
+                #[serde(default)]
+                trim: Option<bool>,
             }
 
             fn default_grep_path() -> String {
@@ -96,6 +123,80 @@ impl ToolRegistry {
 
             let payload: GrepArgs =
                 serde_json::from_value(args).context("grep_file requires a 'pattern' field")?;
+
+            // Validate the path parameter to avoid security issues
+            if payload.path.contains("..") || payload.path.starts_with('/') {
+                return Err(anyhow!(
+                    "Path must be a relative path and cannot contain '..' or start with '/'"
+                ));
+            }
+
+            // Validate and enforce hard limits
+            if let Some(max_results) = payload.max_results {
+                // Enforce a reasonable upper limit to prevent excessive resource usage
+                const MAX_ALLOWED_RESULTS: usize = 1000;
+                if max_results > MAX_ALLOWED_RESULTS {
+                    return Err(anyhow!(
+                        "max_results ({}) exceeds the maximum allowed value of {}",
+                        max_results,
+                        MAX_ALLOWED_RESULTS
+                    ));
+                }
+                if max_results == 0 {
+                    return Err(anyhow!("max_results must be greater than 0"));
+                }
+            }
+
+            if let Some(max_file_size) = payload.max_file_size {
+                // Enforce a reasonable upper limit for file size (100MB)
+                const MAX_ALLOWED_FILE_SIZE: usize = 100 * 1024 * 1024; // 100MB in bytes
+                if max_file_size > MAX_ALLOWED_FILE_SIZE {
+                    return Err(anyhow!(
+                        "max_file_size ({}) exceeds the maximum allowed value of {} bytes (100MB)",
+                        max_file_size,
+                        MAX_ALLOWED_FILE_SIZE
+                    ));
+                }
+                if max_file_size == 0 {
+                    return Err(anyhow!("max_file_size must be greater than 0"));
+                }
+            }
+
+            // Validate context_lines to prevent excessive context
+            if let Some(context_lines) = payload.context_lines {
+                const MAX_ALLOWED_CONTEXT: usize = 20; // Increased from 10 to 20 for more flexibility
+                if context_lines > MAX_ALLOWED_CONTEXT {
+                    return Err(anyhow!(
+                        "context_lines ({}) exceeds the maximum allowed value of {}",
+                        context_lines,
+                        MAX_ALLOWED_CONTEXT
+                    ));
+                }
+                if (context_lines as i32) < 0 {
+                    return Err(anyhow!("context_lines must not be negative"));
+                }
+            }
+
+            // Validate glob_pattern for security
+            if let Some(glob_pattern) = &payload.glob_pattern {
+                if glob_pattern.contains("..") || glob_pattern.starts_with('/') {
+                    return Err(anyhow!(
+                        "glob_pattern must be a relative path and cannot contain '..' or start with '/'"
+                    ));
+                }
+            }
+
+            // Validate type_pattern for basic security (only allow alphanumeric, hyphens, underscores)
+            if let Some(type_pattern) = &payload.type_pattern {
+                if !type_pattern
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+                {
+                    return Err(anyhow!(
+                        "type_pattern can only contain alphanumeric characters, hyphens, and underscores"
+                    ));
+                }
+            }
 
             let input = GrepSearchInput {
                 pattern: payload.pattern.clone(),
@@ -106,6 +207,18 @@ impl ToolRegistry {
                 context_lines: payload.context_lines,
                 include_hidden: payload.include_hidden,
                 max_results: payload.max_results,
+                respect_ignore_files: payload.respect_ignore_files,
+                max_file_size: payload.max_file_size,
+                search_hidden: payload.search_hidden,
+                search_binary: payload.search_binary,
+                files_with_matches: payload.files_with_matches,
+                type_pattern: payload.type_pattern,
+                invert_match: payload.invert_match,
+                word_boundaries: payload.word_boundaries,
+                line_number: payload.line_number,
+                column: payload.column,
+                only_matching: payload.only_matching,
+                trim: payload.trim,
             };
 
             let result = manager
@@ -318,11 +431,56 @@ impl ToolRegistry {
         &self,
         payload: &Map<String, Value>,
     ) -> Result<PtyCommandSetup> {
-        let command = parse_command_parts(
+        let mut command = parse_command_parts(
             payload,
             "run_pty_cmd requires a 'command' value",
             "PTY command cannot be empty",
         )?;
+
+        let raw_command = payload
+            .get("raw_command")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string());
+        let shell = resolve_shell_preference(
+            payload.get("shell").and_then(|value| value.as_str()),
+            self.pty_config(),
+        );
+        let login_shell = payload
+            .get("login")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+
+        if let Some(shell_program) = shell {
+            let normalized_shell = normalized_shell_name(&shell_program);
+            let existing_shell = command
+                .first()
+                .map(|existing| normalized_shell_name(existing));
+            if existing_shell != Some(normalized_shell.clone()) {
+                let command_string =
+                    build_shell_command_string(raw_command.as_deref(), &command, &shell_program);
+
+                let mut shell_invocation = Vec::with_capacity(4);
+                shell_invocation.push(shell_program.clone());
+
+                if login_shell && !should_use_windows_command_tokenizer(Some(&shell_program)) {
+                    shell_invocation.push("-l".to_string());
+                }
+
+                let command_flag = if should_use_windows_command_tokenizer(Some(&shell_program)) {
+                    match normalized_shell.as_str() {
+                        "cmd" | "cmd.exe" => "/C".to_string(),
+                        "powershell" | "powershell.exe" | "pwsh" => "-Command".to_string(),
+                        _ => "-c".to_string(),
+                    }
+                } else {
+                    "-c".to_string()
+                };
+
+                shell_invocation.push(command_flag);
+                shell_invocation.push(command_string);
+                command = shell_invocation;
+            }
+        }
 
         let timeout_secs = parse_timeout_secs(
             payload.get("timeout_secs"),
@@ -430,11 +588,54 @@ impl ToolRegistry {
         let session_id =
             parse_session_id(payload, "create_pty_session requires a 'session_id' string")?;
 
-        let command_parts = parse_command_parts(
+        let mut command_parts = parse_command_parts(
             payload,
             "create_pty_session requires a 'command' value",
             "PTY session command cannot be empty",
         )?;
+
+        let login_shell = payload
+            .get("login")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+
+        if let Some(shell_program) = resolve_shell_preference(
+            payload.get("shell").and_then(|value| value.as_str()),
+            self.pty_config(),
+        ) {
+            let should_replace = payload.get("shell").is_some()
+                || (command_parts.len() == 1 && is_default_shell_placeholder(&command_parts[0]));
+            if should_replace {
+                command_parts = vec![shell_program];
+            }
+        }
+
+        if login_shell
+            && !command_parts.is_empty()
+            && !should_use_windows_command_tokenizer(Some(&command_parts[0]))
+            && !command_parts.iter().skip(1).any(|arg| arg == "-l")
+        {
+            command_parts.push("-l".to_string());
+        }
+
+        // Check if this is a development toolchain command in sandbox mode
+        if !command_parts.is_empty() {
+            let program = &command_parts[0];
+            if crate::tools::pty::is_development_toolchain_command(program) {
+                if let Some(_profile) = self.pty_manager().sandbox_profile() {
+                    return Err(anyhow!(
+                        "{} could not be executed in the sandbox. This may be due to missing {} toolchain support in the current environment.\n\n\
+                        Next steps:\n\
+                        - Verify that the {} toolchain is installed and accessible.\n\
+                        - Disable sandbox with `/sandbox disable` to run development tools with local toolchain access.\n\
+                        - Alternatively, run the command directly in your terminal outside VT Code.",
+                        program,
+                        program,
+                        program
+                    ));
+                }
+            }
+        }
 
         let working_dir = self
             .pty_manager()
@@ -541,7 +742,7 @@ impl ToolRegistry {
             Value::Bool(input.append_newline),
         );
         if let Some(output) = output {
-            response.insert("output".to_string(), Value::String(output));
+            response.insert("output".to_string(), Value::String(strip_ansi(&output)));
         }
 
         Ok(Value::Object(response))
@@ -570,7 +771,7 @@ impl ToolRegistry {
         let mut response = snapshot_to_map(snapshot, view_args.view);
         response.insert("success".to_string(), Value::Bool(true));
         if let Some(output) = output {
-            response.insert("output".to_string(), Value::String(output));
+            response.insert("output".to_string(), Value::String(strip_ansi(&output)));
         }
 
         Ok(Value::Object(response))
@@ -860,6 +1061,15 @@ fn build_pty_args_from_terminal(args: &Value, command_vec: &[String]) -> Map<Str
     }
     if let Some(cols) = args.get("cols").cloned() {
         pty_args.insert("cols".to_string(), cols);
+    }
+    if let Some(shell) = args.get("shell").cloned() {
+        pty_args.insert("shell".to_string(), shell);
+    }
+    if let Some(login) = args.get("login").cloned() {
+        pty_args.insert("login".to_string(), login);
+    }
+    if let Some(raw_command) = args.get("raw_command").cloned() {
+        pty_args.insert("raw_command".to_string(), raw_command);
     }
 
     pty_args
@@ -1220,17 +1430,181 @@ fn snapshot_to_map(
 
     if options.include_screen {
         if let Some(screen) = screen_contents {
-            response.insert("screen_contents".to_string(), Value::String(screen));
+            response.insert(
+                "screen_contents".to_string(),
+                Value::String(strip_ansi(&screen)),
+            );
         }
     }
 
     if options.include_scrollback {
         if let Some(scrollback) = scrollback {
-            response.insert("scrollback".to_string(), Value::String(scrollback));
+            response.insert(
+                "scrollback".to_string(),
+                Value::String(strip_ansi(&scrollback)),
+            );
         }
     }
 
     response
+}
+
+fn strip_ansi(text: &str) -> String {
+    struct AnsiStripper {
+        output: String,
+    }
+
+    impl AnsiStripper {
+        fn new(capacity: usize) -> Self {
+            Self {
+                output: String::with_capacity(capacity),
+            }
+        }
+    }
+
+    impl Perform for AnsiStripper {
+        fn print(&mut self, c: char) {
+            self.output.push(c);
+        }
+
+        fn execute(&mut self, byte: u8) {
+            match byte {
+                b'\n' => self.output.push('\n'),
+                b'\r' => self.output.push('\r'),
+                b'\t' => self.output.push('\t'),
+                _ => {}
+            }
+        }
+
+        fn hook(
+            &mut self,
+            _params: &vte::Params,
+            _intermediates: &[u8],
+            _ignore: bool,
+            _action: char,
+        ) {
+        }
+
+        fn put(&mut self, _byte: u8) {}
+
+        fn unhook(&mut self) {}
+
+        fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+
+        fn csi_dispatch(
+            &mut self,
+            _params: &vte::Params,
+            _intermediates: &[u8],
+            _ignore: bool,
+            _action: char,
+        ) {
+        }
+
+        fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _action: u8) {}
+    }
+
+    let mut performer = AnsiStripper::new(text.len());
+    let mut parser = Parser::new();
+
+    for byte in text.as_bytes() {
+        parser.advance(&mut performer, *byte);
+    }
+
+    performer.output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_ansi() {
+        assert_eq!(strip_ansi("hello"), "hello");
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
+        assert_eq!(strip_ansi("\x1b[1;32mbold green\x1b[0m"), "bold green");
+        assert_eq!(
+            strip_ansi("Checking \x1b[0m\x1b[1m\x1b[32mvtcode\x1b[0m"),
+            "Checking vtcode"
+        );
+    }
+
+    #[test]
+    fn windows_tokenizer_preserves_paths_with_spaces() {
+        let command = r#""C:\Program Files\Git\bin\bash.exe" -lc "echo hi""#;
+        let tokens = tokenize_command_string(command, Some("cmd.exe")).expect("tokens");
+        assert_eq!(
+            tokens,
+            vec![
+                r"C:\Program Files\Git\bin\bash.exe".to_string(),
+                "-lc".to_string(),
+                "echo hi".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_tokenizer_handles_empty_arguments() {
+        let tokens = tokenize_windows_command("\"\"").expect("tokens");
+        assert_eq!(tokens, vec![String::new()]);
+    }
+
+    #[test]
+    fn windows_tokenizer_errors_on_unterminated_quotes() {
+        let err = tokenize_windows_command("\"unterminated").unwrap_err();
+        assert!(err.to_string().contains("unterminated"));
+    }
+
+    #[test]
+    fn windows_join_quotes_arguments_with_spaces() {
+        let parts = vec![
+            r"C:\Program Files\Git\bin\git.exe".to_string(),
+            "--version".to_string(),
+        ];
+        let joined = join_windows_command(&parts);
+        assert_eq!(
+            joined,
+            r#""C:\Program Files\Git\bin\git.exe" --version"#.to_string()
+        );
+    }
+
+    #[test]
+    fn windows_join_leaves_simple_arguments_unquoted() {
+        let parts = vec!["cmd".to_string(), "/C".to_string(), "dir".to_string()];
+        let joined = join_windows_command(&parts);
+        assert_eq!(joined, "cmd /C dir");
+    }
+
+    #[test]
+    fn tokenizer_uses_posix_rules_for_posix_shells() {
+        let tokens =
+            tokenize_command_string("echo 'hello world'", Some("/bin/bash")).expect("tokens");
+        assert_eq!(tokens, vec!["echo", "hello world"]);
+    }
+
+    #[test]
+    fn detects_windows_shell_name_variants() {
+        assert!(should_use_windows_command_tokenizer(Some(
+            "C:/Windows/System32/cmd.exe"
+        )));
+        assert!(should_use_windows_command_tokenizer(Some("pwsh")));
+        assert_eq!(normalized_shell_name("/bin/bash"), "bash");
+    }
+
+    #[test]
+    fn resolve_shell_preference_uses_explicit_value() {
+        let mut config = PtyConfig::default();
+        config.preferred_shell = Some("/bin/bash".to_string());
+        let resolved = super::resolve_shell_preference(Some("/custom/zsh"), &config);
+        assert_eq!(resolved.as_deref(), Some("/custom/zsh"));
+    }
+
+    #[test]
+    fn resolve_shell_preference_uses_config_value() {
+        let mut config = PtyConfig::default();
+        config.preferred_shell = Some("/bin/zsh".to_string());
+        let resolved = super::resolve_shell_preference(None, &config);
+        assert_eq!(resolved.as_deref(), Some("/bin/zsh"));
+    }
 }
 
 struct PtySessionViewArgs {
@@ -1319,23 +1693,43 @@ async fn collect_ephemeral_session_output(
     let start = Instant::now();
     let mut completed = false;
     let mut exit_code = None;
+    let poll_interval = Duration::from_millis(50);
+    let min_wait = Duration::from_millis(200); // Wait at least 200ms for fast commands
 
     loop {
         if let Ok(Some(new_output)) = manager.read_session_output(session_id, true) {
-            output.push_str(&new_output);
+            if !new_output.is_empty() {
+                output.push_str(&new_output);
+            }
         }
 
         if let Ok(Some(code)) = manager.is_session_completed(session_id) {
             completed = true;
             exit_code = Some(code);
+            // Drain any remaining output
+            if let Ok(Some(final_output)) = manager.read_session_output(session_id, true) {
+                output.push_str(&final_output);
+            }
             break;
         }
 
-        if start.elapsed() > poll_timeout {
+        let elapsed = start.elapsed();
+
+        // For long-running commands, return partial output early
+        if elapsed > poll_timeout {
             break;
         }
 
-        sleep(Duration::from_millis(100)).await;
+        // If we have output and minimum wait time passed, check if we should return early
+        if !output.is_empty() && elapsed > min_wait {
+            // Return early if command is still running and we have output
+            // This allows the agent to show progress
+            if elapsed > Duration::from_secs(2) {
+                break;
+            }
+        }
+
+        sleep(poll_interval).await;
     }
 
     PtyEphemeralCapture {
@@ -1368,7 +1762,7 @@ fn build_ephemeral_pty_response(
     json!({
         "success": true,
         "command": setup.command.clone(),
-        "output": output,
+        "output": strip_ansi(&output),
         "code": code,
         "mode": "pty",
         "session_id": session_reference,
@@ -1380,6 +1774,74 @@ fn build_ephemeral_pty_response(
         "timeout_secs": setup.timeout_secs,
         "duration_ms": if completed { duration.as_millis() } else { 0 },
     })
+}
+
+fn build_shell_command_string(
+    raw_command: Option<&str>,
+    parts: &[String],
+    shell_hint: &str,
+) -> String {
+    if let Some(raw) = raw_command {
+        return raw.to_string();
+    }
+
+    if should_use_windows_command_tokenizer(Some(shell_hint)) {
+        return join_windows_command(parts);
+    }
+
+    join(parts.iter().map(|part| part.as_str()))
+}
+
+fn join_windows_command(parts: &[String]) -> String {
+    parts
+        .iter()
+        .map(|part| quote_windows_argument(part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn quote_windows_argument(arg: &str) -> String {
+    if arg.is_empty() {
+        return "\"\"".to_string();
+    }
+
+    let requires_quotes = arg
+        .chars()
+        .any(|c| c.is_whitespace() || c == '"' || c == '\t');
+    if !requires_quotes {
+        return arg.to_string();
+    }
+
+    let mut result = String::with_capacity(arg.len() + 2);
+    result.push('"');
+
+    let mut backslashes = 0;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => {
+                backslashes += 1;
+            }
+            '"' => {
+                result.extend(std::iter::repeat('\\').take(backslashes * 2 + 1));
+                result.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                if backslashes > 0 {
+                    result.extend(std::iter::repeat('\\').take(backslashes));
+                    backslashes = 0;
+                }
+                result.push(ch);
+            }
+        }
+    }
+
+    if backslashes > 0 {
+        result.extend(std::iter::repeat('\\').take(backslashes * 2));
+    }
+
+    result.push('"');
+    result
 }
 
 fn sanitize_command_string(command: &str) -> Cow<'_, str> {
@@ -1467,6 +1929,59 @@ fn tokenize_windows_command(command: &str) -> Result<Vec<String>> {
     Ok(tokens)
 }
 
+fn resolve_shell_preference(explicit: Option<&str>, config: &PtyConfig) -> Option<String> {
+    explicit
+        .and_then(sanitize_shell_candidate)
+        .or_else(|| {
+            config
+                .preferred_shell
+                .as_deref()
+                .and_then(sanitize_shell_candidate)
+        })
+        .or_else(|| {
+            env::var("SHELL")
+                .ok()
+                .and_then(|value| sanitize_shell_candidate(&value))
+        })
+        .or_else(detect_posix_shell_candidate)
+}
+
+fn sanitize_shell_candidate(shell: &str) -> Option<String> {
+    let trimmed = shell.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn detect_posix_shell_candidate() -> Option<String> {
+    if cfg!(windows) {
+        return None;
+    }
+
+    const CANDIDATES: [&str; 6] = [
+        "/bin/zsh",
+        "/usr/bin/zsh",
+        "/bin/bash",
+        "/usr/bin/bash",
+        "/bin/sh",
+        "/usr/bin/sh",
+    ];
+
+    for candidate in CANDIDATES {
+        if Path::new(candidate).exists() {
+            return Some(candidate.to_string());
+        }
+    }
+
+    None
+}
+
+fn is_default_shell_placeholder(program: &str) -> bool {
+    matches!(normalized_shell_name(program).as_str(), "bash" | "sh")
+}
+
 fn is_windows_shell(shell: &str) -> bool {
     matches!(
         normalized_shell_name(shell).as_str(),
@@ -1514,55 +2029,5 @@ impl Drop for PtySessionLifecycle<'_> {
         if self.active {
             self.registry.end_pty_session();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        normalized_shell_name, should_use_windows_command_tokenizer, tokenize_command_string,
-        tokenize_windows_command,
-    };
-
-    #[test]
-    fn windows_tokenizer_preserves_paths_with_spaces() {
-        let command = r#""C:\Program Files\Git\bin\bash.exe" -lc "echo hi""#;
-        let tokens = tokenize_command_string(command, Some("cmd.exe")).expect("tokens");
-        assert_eq!(
-            tokens,
-            vec![
-                r"C:\Program Files\Git\bin\bash.exe".to_string(),
-                "-lc".to_string(),
-                "echo hi".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn windows_tokenizer_handles_empty_arguments() {
-        let tokens = tokenize_windows_command("\"\"").expect("tokens");
-        assert_eq!(tokens, vec![String::new()]);
-    }
-
-    #[test]
-    fn windows_tokenizer_errors_on_unterminated_quotes() {
-        let err = tokenize_windows_command("\"unterminated").unwrap_err();
-        assert!(err.to_string().contains("unterminated"));
-    }
-
-    #[test]
-    fn tokenizer_uses_posix_rules_for_posix_shells() {
-        let tokens =
-            tokenize_command_string("echo 'hello world'", Some("/bin/bash")).expect("tokens");
-        assert_eq!(tokens, vec!["echo", "hello world"]);
-    }
-
-    #[test]
-    fn detects_windows_shell_name_variants() {
-        assert!(should_use_windows_command_tokenizer(Some(
-            "C:/Windows/System32/cmd.exe"
-        )));
-        assert!(should_use_windows_command_tokenizer(Some("pwsh")));
-        assert_eq!(normalized_shell_name("/bin/bash"), "bash");
     }
 }
