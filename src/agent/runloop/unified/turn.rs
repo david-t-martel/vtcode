@@ -50,6 +50,7 @@ use crate::agent::runloop::ui::{build_inline_header_context, render_session_bann
 use crate::agent::runloop::unified::ui_interaction::{
     PlaceholderSpinner, display_session_status, display_token_cost, stream_and_render_response,
 };
+use crate::ide_context::IdeContextBridge;
 
 use super::context_manager::ContextManager;
 use super::curator::{build_curator_tools, format_provider_label, resolve_mode_label};
@@ -332,6 +333,8 @@ pub(crate) async fn run_single_agent_loop_unified(
     let trim_config = context_manager.trim_config();
     let token_budget_enabled = context_manager.token_budget_enabled();
 
+    let mut ide_context_bridge = IdeContextBridge::from_env();
+
     let active_styles = theme::active_styles();
     let theme_spec = theme_from_styles(&active_styles);
     let mut default_placeholder = session_bootstrap
@@ -413,6 +416,20 @@ pub(crate) async fn run_single_agent_loop_unified(
     });
 
     transcript::clear();
+
+    if let Some(bridge) = ide_context_bridge.as_mut() {
+        match bridge.snapshot() {
+            Ok(Some(context)) => {
+                renderer.line(MessageStyle::Info, "Loaded VS Code IDE context snapshot.")?;
+                conversation_history.push(uni::Message::system(context));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!("Failed to read IDE context snapshot: {}", err);
+                ide_context_bridge = None;
+            }
+        }
+    }
 
     if let Some(session) = resume.as_ref() {
         let ended_local = session
@@ -1200,6 +1217,19 @@ pub(crate) async fn run_single_agent_loop_unified(
                 }
             }
             _ => {}
+        }
+
+        if let Some(bridge) = ide_context_bridge.as_mut() {
+            match bridge.snapshot() {
+                Ok(Some(context)) => {
+                    conversation_history.push(uni::Message::system(context));
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    warn!("Failed to update IDE context snapshot: {}", err);
+                    ide_context_bridge = None;
+                }
+            }
         }
 
         if let Some(hooks) = &lifecycle_hooks {

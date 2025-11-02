@@ -82,7 +82,9 @@ impl FileOpsTool {
                     continue;
                 }
 
-                let is_dir = entry.file_type().await
+                let is_dir = entry
+                    .file_type()
+                    .await
                     .with_context(|| format!("Failed to read file type for: {}", path.display()))?
                     .is_dir();
                 all_items.push(json!({
