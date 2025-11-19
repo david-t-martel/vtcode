@@ -716,8 +716,8 @@ pub(crate) async fn stream_and_render_response(
         match event_result {
             Ok(LLMStreamEvent::Token { delta }) => {
                 if !streaming_state_set {
-                    renderer
-                        .handle()
+                    spinner
+                        .handle
                         .set_agent_state(vtcode_core::ui::state::AgentState::Streaming);
                     streaming_state_set = true;
                 }

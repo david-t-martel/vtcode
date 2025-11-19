@@ -341,25 +341,15 @@ pub(crate) fn load_context_trim_config(vt_cfg: Option<&VTCodeConfig>) -> Context
 /// This provides a fast approximation without requiring actual tokenization.
 #[allow(dead_code)]
 fn approximate_unified_message_tokens(message: &uni::Message) -> usize {
-    let mut total_chars = message.content.as_text().len();
+    let mut total_chars = message.content.as_text().unwrap_or_default().len();
     total_chars += message.role.as_generic_str().len();
 
     if let Some(tool_calls) = &message.tool_calls {
         total_chars += tool_calls.iter().fold(0, |acc, call| {
             acc + call.id.len()
                 + call.call_type.len()
-                + call
-                    .function
-                    .as_ref()
-                    .expect("Tool call must have function")
-                    .name
-                    .len()
-                + call
-                    .function
-                    .as_ref()
-                    .expect("Tool call must have function")
-                    .arguments
-                    .len()
+                + call.function.name.len()
+                + call.function.arguments.len()
         });
     }
 
@@ -443,18 +433,18 @@ fn compute_semantic_score(
     analyzer: &mut TreeSitterAnalyzer,
     config: &ContextTrimConfig,
 ) -> u8 {
-    let message_text = message.content.as_text();
-    let mut code_blocks = extract_code_blocks(&message_text);
+    let message_text = message.content.as_text().unwrap_or_default();
+    let mut code_blocks = extract_code_blocks(message_text);
 
     // If no explicit code blocks but content looks like code, treat entire message as code
     if code_blocks.is_empty()
         && analyzer
-            .detect_language_from_content(&message_text)
+            .detect_language_from_content(message_text)
             .is_some()
     {
         code_blocks.push(CodeBlock {
             language_hint: None,
-            content: message_text.clone(),
+            content: message_text.to_string(),
         });
     }
 
@@ -647,16 +637,8 @@ fn message_semantic_hash(message: &uni::Message) -> u64 {
     if let Some(tool_calls) = &message.tool_calls {
         for call in tool_calls {
             call.id.hash(&mut hasher);
-            call.function
-                .as_ref()
-                .expect("Tool call must have function")
-                .name
-                .hash(&mut hasher);
-            call.function
-                .as_ref()
-                .expect("Tool call must have function")
-                .arguments
-                .hash(&mut hasher);
+            call.function.name.hash(&mut hasher);
+            call.function.arguments.hash(&mut hasher);
         }
     }
 

@@ -1017,7 +1017,7 @@ pub(crate) async fn run_single_agent_loop_unified(
                     let parallel = budget.and_then(|b| b.max_parallel_tools).map(|value| {
                         vtcode_core::llm::provider::ParallelToolConfig {
                             disable_parallel_tool_use: value <= 1,
-                            max_parallel_tools: Some(value),
+                            max_parallel_tools: Some(value as u32),
                             encourage_parallel: value > 1,
                         }
                     });
@@ -1032,7 +1032,8 @@ pub(crate) async fn run_single_agent_loop_unified(
                         working_history.len(),
                         working_history
                             .last()
-                            .map(|message| message.content.as_text()),
+                            .and_then(|message| message.content.as_text())
+                            .map(|text| text.to_string()),
                     );
                     let tool_names: Vec<String> = {
                         let snapshot = tools.read().await;
@@ -1070,11 +1071,26 @@ pub(crate) async fn run_single_agent_loop_unified(
                         None
                     }
                 });
-                let current_tools = tools.read().await.clone();
+                let current_tool_defs = tools.read().await.clone();
+                let current_tools: Vec<uni::Tool> = current_tool_defs
+                    .iter()
+                    .filter_map(|def| def.function.as_ref().map(|f| uni::Tool {
+                        function: uni::Function {
+                            name: f.name.clone(),
+                            description: f.description.clone(),
+                            parameters: f.parameters.clone(),
+                        },
+                    }))
+                    .collect();
+
                 let request = uni::LLMRequest {
                     messages: request_history.clone(),
                     system_prompt: Some(system_prompt),
-                    tools: Some(current_tools),
+                    tools: if current_tools.is_empty() {
+                        None
+                    } else {
+                        Some(current_tools)
+                    },
                     model: active_model.clone(),
                     max_tokens: max_tokens_opt.or(Some(2000)),
                     temperature: Some(0.7),
@@ -1215,7 +1231,7 @@ pub(crate) async fn run_single_agent_loop_unified(
                     }
                 };
 
-                let mut final_text = response.content.clone();
+                let mut final_text = Some(response.content.clone());
                 let mut tool_calls = response.tool_calls.unwrap_or_default();
                 let mut interpreted_textual_call = false;
                 let assistant_reasoning = response.reasoning.clone();
@@ -1280,12 +1296,7 @@ pub(crate) async fn run_single_agent_loop_unified(
                     // This prevents the loop from breaking after tool execution
                     let _ = final_text.take();
                     for call in &tool_calls {
-                        let name = call
-                            .function
-                            .as_ref()
-                            .expect("Tool call must have function")
-                            .name
-                            .as_str();
+                        let name = call.function.name.as_str();
                         let args_val = call
                             .parsed_arguments()
                             .unwrap_or_else(|_| serde_json::json!({}));
@@ -2128,7 +2139,7 @@ pub(crate) async fn run_single_agent_loop_unified(
                     continue 'outer;
                 }
 
-                if let Some(mut text) = final_text {
+                if let Some(mut text) = final_text.clone() {
                     let do_review = vt_cfg
                         .as_ref()
                         .map(|cfg| cfg.agent.enable_self_review)
@@ -2168,7 +2179,7 @@ pub(crate) async fn run_single_agent_loop_unified(
                                 verbosity: None,
                             };
                             let rr = provider_client.generate(review_req).await.ok();
-                            if let Some(r) = rr.and_then(|result| result.content)
+                            if let Some(r) = rr.map(|result| result.content)
                                 && !r.trim().is_empty()
                             {
                                 text = r;
@@ -2187,12 +2198,7 @@ pub(crate) async fn run_single_agent_loop_unified(
                         break TurnLoopResult::Completed;
                     }
 
-                    let streamed_matches_output = response_streamed
-                        && response
-                            .content
-                            .as_ref()
-                            .map(|original| original == &text)
-                            .unwrap_or(false);
+                    let streamed_matches_output = response_streamed && response.content == text;
 
                     if !suppress_response && !streamed_matches_output {
                         renderer.line(MessageStyle::Response, &text)?;
@@ -2245,16 +2251,17 @@ pub(crate) async fn run_single_agent_loop_unified(
                     if let Some(last) = conversation_history.last()
                         && last.role == uni::MessageRole::Assistant
                     {
-                        let text = last.content.as_text();
-                        let claims_write = text.contains("I've updated")
-                            || text.contains("I have updated")
-                            || text.contains("updated the `");
-                        if claims_write && !any_write_effect {
-                            renderer.line_if_not_empty(MessageStyle::Output)?;
-                            renderer.line(
-                                MessageStyle::Info,
-                                "Note: The assistant mentioned edits but no write tool ran.",
-                            )?;
+                        if let Some(text) = last.content.as_text() {
+                            let claims_write = text.contains("I've updated")
+                                || text.contains("I have updated")
+                                || text.contains("updated the `");
+                            if claims_write && !any_write_effect {
+                                renderer.line_if_not_empty(MessageStyle::Output)?;
+                                renderer.line(
+                                    MessageStyle::Info,
+                                    "Note: The assistant mentioned edits but no write tool ran.",
+                                )?;
+                            }
                         }
                     }
 
@@ -2266,9 +2273,10 @@ pub(crate) async fn run_single_agent_loop_unified(
                         let turn_number = next_checkpoint_turn;
                         let description = conversation_history
                             .last()
-                            .map(|msg| msg.content.as_text())
-                            .unwrap_or_default();
-                        let description = description.trim().to_string();
+                            .and_then(|msg| msg.content.as_text())
+                            .unwrap_or_default()
+                            .trim()
+                            .to_string();
                         match manager
                             .create_snapshot(
                                 turn_number,

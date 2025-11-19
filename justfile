@@ -19,13 +19,11 @@ check:
 build:
     cargo build --release
 
-# Windows-native release build (runs locally on Windows or via PowerShell if available)
+# Windows-native release build
+# On Windows, this runs directly in PowerShell.
+# On Unix-like hosts, it runs in the configured shell and still just calls cargo.
 build-windows:
-    if command -v powershell.exe >/dev/null 2>&1 && [ "${OS:-}" != "Windows_NT" ]; then \
-        powershell.exe -NoLogo -Command "cargo build --release --target x86_64-pc-windows-msvc"; \
-    else \
-        cargo build --release --target x86_64-pc-windows-msvc; \
-    fi
+    cargo build --release --target x86_64-pc-windows-msvc
 
 # Optimized WSL->Windows build: runs cargo inside Windows using a converted path and shared target dir
 wsl-windows-build target_dir="C:/vtcode/target-windows":

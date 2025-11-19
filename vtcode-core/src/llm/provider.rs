@@ -13,9 +13,9 @@ use std::pin::Pin;
 use crate::config::types::{ReasoningEffortLevel, VerbosityLevel};
 // Re-export core LLM types so downstream modules can import from `llm::provider`.
 pub use crate::llm::types::{
-    FinishReason, Function, FunctionCall, FunctionDefinition, LLMError, LLMRequest, LLMResponse,
-    LLMStreamEvent, Message, MessageContent, MessageRole, ParallelToolConfig, Tool, ToolCall,
-    ToolChoice, ToolDefinition, Usage,
+    ContentPart, FinishReason, Function, FunctionCall, FunctionDefinition, LLMError, LLMRequest,
+    LLMResponse, LLMStreamEvent, Message, MessageContent, MessageRole, ParallelToolConfig, Tool,
+    ToolCall, ToolChoice, ToolDefinition, Usage,
 };
 
 pub type LLMStream = Pin<Box<dyn Stream<Item = Result<LLMStreamEvent, LLMError>> + Send>>;

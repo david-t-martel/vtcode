@@ -81,7 +81,7 @@ pub(crate) async fn refine_user_prompt_if_enabled(
     match refiner
         .generate(req)
         .await
-        .map(|response| response.content.unwrap_or_default())
+        .map(|response| response.content)
     {
         Ok(text) if should_accept_refinement(raw, &text) => {
             // If the user's prompt looks like a debug/analyze request, append a concise tools hint

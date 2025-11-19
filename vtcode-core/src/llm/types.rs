@@ -3,7 +3,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::pin::Pin;
 
 /// Backend kind for LLM providers
@@ -62,10 +62,62 @@ impl Message {
         }
     }
 
+    pub fn user_with_parts(parts: Vec<ContentPart>) -> Self {
+        Self {
+            role: MessageRole::User,
+            content: MessageContent::Parts(parts),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: None,
+            reasoning_details: None,
+            origin_tool: None,
+        }
+    }
+
     pub fn assistant(content: String) -> Self {
         Self {
             role: MessageRole::Assistant,
             content: MessageContent::Text(content),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: None,
+            reasoning_details: None,
+            origin_tool: None,
+        }
+    }
+
+    pub fn system(content: String) -> Self {
+        Self {
+            role: MessageRole::System,
+            content: MessageContent::Text(content),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: None,
+            reasoning_details: None,
+            origin_tool: None,
+        }
+    }
+
+    pub fn assistant_with_tools(content: String, tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: MessageRole::Assistant,
+            content: MessageContent::Text(content),
+            tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls)
+            },
+            tool_call_id: None,
+            reasoning: None,
+            reasoning_details: None,
+            origin_tool: None,
+        }
+    }
+
+    pub fn assistant_with_parts(parts: Vec<ContentPart>) -> Self {
+        Self {
+            role: MessageRole::Assistant,
+            content: MessageContent::Parts(parts),
             tool_calls: None,
             tool_call_id: None,
             reasoning: None,
@@ -86,6 +138,22 @@ impl Message {
         }
     }
 
+    pub fn tool_response_with_origin(
+        tool_call_id: String,
+        content: String,
+        origin_tool: String,
+    ) -> Self {
+        Self {
+            role: MessageRole::Tool,
+            content: MessageContent::Text(content),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id),
+            reasoning: None,
+            reasoning_details: None,
+            origin_tool: Some(origin_tool),
+        }
+    }
+
     pub fn as_text(&self) -> Option<&str> {
         match &self.content {
             MessageContent::Text(text) => Some(text),
@@ -95,6 +163,22 @@ impl Message {
 
     pub fn as_tool_calls(&self) -> Option<&Vec<ToolCall>> {
         self.tool_calls.as_ref()
+    }
+
+    pub fn is_tool_response(&self) -> bool {
+        matches!(self.role, MessageRole::Tool)
+    }
+
+    pub fn has_tool_calls(&self) -> bool {
+        self.tool_calls
+            .as_ref()
+            .map(|calls| !calls.is_empty())
+            .unwrap_or(false)
+    }
+
+    pub fn with_reasoning(mut self, reasoning: Option<String>) -> Self {
+        self.reasoning = reasoning;
+        self
     }
 
     pub fn validate_for_provider(&self, _provider_key: &str) -> Result<(), String> {
@@ -157,6 +241,14 @@ pub enum MessageContent {
 }
 
 impl MessageContent {
+    pub fn text(text: String) -> Self {
+        MessageContent::Text(text)
+    }
+
+    pub fn parts(parts: Vec<ContentPart>) -> Self {
+        MessageContent::Parts(parts)
+    }
+
     pub fn as_text(&self) -> Option<&str> {
         match self {
             MessageContent::Text(text) => Some(text),
@@ -176,6 +268,21 @@ impl MessageContent {
 pub enum ContentPart {
     Text { text: String },
     Image { url: String },
+}
+
+impl ContentPart {
+    pub fn text(text: String) -> Self {
+        ContentPart::Text { text }
+    }
+
+    /// Backwards-compatible helper for constructing image parts from raw data and MIME type.
+    ///
+    /// The data and MIME type are combined into a data URL of the form
+    /// `data:<mime_type>;base64,<data>` and stored in the `url` field.
+    pub fn image(data: String, mime_type: String) -> Self {
+        let url = format!("data:{};base64,{}", mime_type, data);
+        ContentPart::Image { url }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -356,6 +463,31 @@ impl ToolDefinition {
                 parameters,
             }),
             shell: None,
+            grammar: None,
+            strict: None,
+        }
+    }
+
+    pub fn apply_patch(description: String) -> Self {
+        let parameters = json!({
+            "type": "object",
+            "properties": {
+                "input": {
+                    "type": "string",
+                    "description": "Structured patch content (e.g. unified diff) to apply to the workspace.",
+                }
+            },
+            "required": ["input"],
+            "additionalProperties": false
+        });
+        Self::function("apply_patch".to_string(), description, parameters)
+    }
+
+    pub fn shell(config: Option<Value>) -> Self {
+        Self {
+            tool_type: "shell".to_string(),
+            function: None,
+            shell: config,
             grammar: None,
             strict: None,
         }
