@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use std::path::Path;
 
-use crate::llm::provider::{ContentPart, MessageContent};
+use crate::llm::types::{ContentPart, MessageContent};
 use crate::utils::image_processing::read_image_file;
 
 /// Parse the @ pattern in text and replace image file paths with base64 content
@@ -60,7 +60,9 @@ pub async fn parse_at_patterns(input: &str, base_dir: &Path) -> Result<MessageCo
         if start > last_end {
             let text_before = &input[last_end..start];
             if !text_before.trim().is_empty() {
-                parts.push(ContentPart::text(text_before.to_string()));
+                parts.push(ContentPart::Text {
+                    text: text_before.to_string(),
+                });
             }
         }
 
@@ -68,7 +70,9 @@ pub async fn parse_at_patterns(input: &str, base_dir: &Path) -> Result<MessageCo
         let normalized_path = normalize_path(path_part);
         if normalized_path.is_empty() {
             // Skip invalid paths (likely directory traversal attempts)
-            parts.push(ContentPart::text(full_match.to_string()));
+            parts.push(ContentPart::Text {
+                text: full_match.to_string(),
+            });
             last_end = end;
             continue;
         }
@@ -79,15 +83,17 @@ pub async fn parse_at_patterns(input: &str, base_dir: &Path) -> Result<MessageCo
         match read_image_file(&image_path).await {
             Ok(image_data) => {
                 // Add the image as a content part
-                parts.push(ContentPart::Image {
-                    data: image_data.base64_data,
-                    mime_type: image_data.mime_type,
-                    content_type: "image".to_string(),
-                });
+                let data_url = format!(
+                    "data:{};base64,{}",
+                    image_data.mime_type, image_data.base64_data
+                );
+                parts.push(ContentPart::Image { url: data_url });
             }
             Err(_) => {
                 // If it's not a valid image file, treat as text (might be regular @ usage)
-                parts.push(ContentPart::text(full_match.to_string()));
+                parts.push(ContentPart::Text {
+                    text: full_match.to_string(),
+                });
             }
         }
 
@@ -98,23 +104,25 @@ pub async fn parse_at_patterns(input: &str, base_dir: &Path) -> Result<MessageCo
     if last_end < input.len() {
         let text_after = &input[last_end..];
         if !text_after.trim().is_empty() {
-            parts.push(ContentPart::text(text_after.to_string()));
+            parts.push(ContentPart::Text {
+                text: text_after.to_string(),
+            });
         }
     }
 
     // If no @ patterns were found, return the original text
     if parts.is_empty() {
-        Ok(MessageContent::text(input.to_string()))
+        Ok(MessageContent::Text(input.to_string()))
     } else if parts.len() == 1 && matches!(parts[0], ContentPart::Text { .. }) {
         // If only one text part, return as simple text
         if let ContentPart::Text { text } = &parts[0] {
-            Ok(MessageContent::text(text.clone()))
+            Ok(MessageContent::Text(text.clone()))
         } else {
-            Ok(MessageContent::parts(parts))
+            Ok(MessageContent::Parts(parts))
         }
     } else {
         // Otherwise return as multi-part content
-        Ok(MessageContent::parts(parts))
+        Ok(MessageContent::Parts(parts))
     }
 }
 

@@ -306,7 +306,7 @@ async fn handle_test_provider(_cli: &Cli, provider: &str) -> Result<()> {
 
     match provider_instance.generate(test_request).await {
         Ok(response) => {
-            let content = response.content.unwrap_or_default();
+            let content = response.content;
             if content.to_lowercase().contains("ok") {
                 println!("{} {} test successful!", green("✓"), green(&bold(provider)));
             } else {

@@ -33,7 +33,7 @@ pub struct ProviderCapabilities {
     pub model: String,
 
     /// Effective context window size (in tokens)
-    pub context_size: usize,
+    pub context_size: Option<usize>,
 }
 
 impl ProviderCapabilities {
@@ -47,9 +47,9 @@ impl ProviderCapabilities {
             tools: provider.supports_tools(model),
             parallel_tools: provider.supports_parallel_tool_config(model),
             structured_output: provider.supports_structured_output(model),
-            context_caching: provider.supports_context_caching(model),
+            context_caching: false,
             model: model.to_string(),
-            context_size: provider.effective_context_size(model),
+            context_size: None,
         }
     }
 
@@ -87,7 +87,7 @@ impl ProviderCapabilities {
         format!(
             "{} ({} tokens): {}",
             self.model,
-            self.context_size,
+            self.context_size.unwrap_or(0),
             if features.is_empty() {
                 "basic".to_string()
             } else {
@@ -113,7 +113,7 @@ mod tests {
             structured_output: true,
             context_caching: true,
             model: "gemini-2.0-pro".to_string(),
-            context_size: 2_000_000,
+            context_size: Some(2_000_000),
         };
 
         let summary = caps.summary();
@@ -135,7 +135,7 @@ mod tests {
             structured_output: false,
             context_caching: false,
             model: "basic-model".to_string(),
-            context_size: 128_000,
+            context_size: Some(128_000),
         };
 
         assert!(!basic.has_advanced_features());

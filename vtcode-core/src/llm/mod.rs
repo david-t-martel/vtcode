@@ -28,33 +28,39 @@
 //! ## Basic Usage
 //!
 //! ```rust,no_run
-//! use vtcode_core::llm::{AnyClient, make_client};
-//! use vtcode_core::utils::dot_config::ProviderConfigs;
+//! use std::str::FromStr;
+//! use vtcode_core::config::models::ModelId;
+//! use vtcode_core::llm::cache::LLMCacheConfig;
+//! use vtcode_core::llm::provider::LLMRequest;
+//! use vtcode_core::llm::types::{Message, ToolChoice};
+//! use vtcode_core::llm::make_client;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // Configure providers
-//!     let providers = ProviderConfigs {
-//!         gemini: Some(vtcode_core::utils::dot_config::ProviderConfig {
-//!             api_key: std::env::var("GEMINI_API_KEY")?,
-//!             model: "gemini-2.5-flash".to_string(),
-//!             ..Default::default()
-//!         }),
-//!         ..Default::default()
+//!     let model = ModelId::from_str("gemini-2.5-flash")?;
+//!     let mut client = make_client(
+//!         std::env::var("GEMINI_API_KEY")?,
+//!         model.clone(),
+//!         LLMCacheConfig::default(),
+//!     );
+//!
+//!     let request = LLMRequest {
+//!         messages: vec![Message::user("Hello, how can you help me with coding?".to_string())],
+//!         system_prompt: None,
+//!         tools: None,
+//!         model: model.as_str().to_string(),
+//!         max_tokens: None,
+//!         temperature: None,
+//!         stream: false,
+//!         tool_choice: Some(ToolChoice::none()),
+//!         parallel_tool_calls: None,
+//!         parallel_tool_config: None,
+//!         reasoning_effort: None,
+//!         output_format: None,
+//!         verbosity: None,
 //!     };
 //!
-//!     // Create client
-//!     let client = make_client(&providers, "gemini")?;
-//!
-//!     // Make a request
-//!     let messages = vec![
-//!         vtcode_core::llm::types::Message {
-//!             role: "user".to_string(),
-//!             content: "Hello, how can you help me with coding?".to_string(),
-//!         }
-//!     ];
-//!
-//!     let response = client.chat(&messages, None).await?;
+//!     let response = client.generate_request(&request).await?;
 //!     println!("Response: {}", response.content);
 //!
 //!     Ok(())
@@ -88,49 +94,19 @@
 //! ## Advanced Features
 //!
 //! ### Streaming Responses
-//! ```rust,no_run
-//! use vtcode_core::llm::AnyClient;
+//! ```text
 //! use futures::StreamExt;
-//!
-//! let client = make_client(&providers, "gemini")?;
-//!
-//! let mut stream = client.chat_stream(&messages, None).await?;
+//! let mut stream = provider.stream(request).await?;
 //! while let Some(chunk) = stream.next().await {
-//!     match chunk {
-//!         Ok(response) => print!("{}", response.content),
-//!         Err(e) => eprintln!("Error: {}", e),
-//!     }
+//!     // handle chunk
 //! }
 //! ```
 //!
 //! ### Function Calling
-//! ```rust,no_run
-//! use vtcode_core::llm::types::{FunctionDeclaration, FunctionCall};
-//!
-//! let functions = vec![
-//!     FunctionDeclaration {
-//!         name: "read_file".to_string(),
-//!         description: "Read a file from the filesystem".to_string(),
-//!         parameters: serde_json::json!({
-//!             "type": "object",
-//!             "properties": {
-//!                 "path": {"type": "string", "description": "File path to read"}
-//!             },
-//!             "required": ["path"]
-//!         }),
-//!     }
-//! ];
-//!
-//! let response = client.chat_with_functions(&messages, &functions, None).await?;
-//!
-//! if let Some(function_call) = response.function_call {
-//!     match function_call.name.as_str() {
-//!         "read_file" => {
-//!             // Handle function call
-//!         }
-//!         _ => {}
-//!     }
-//! }
+//! ```text
+//! use vtcode_core::llm::types::FunctionDefinition;
+//! let tools = vec![FunctionDefinition::new(... )];
+//! let request = LLMRequest { tools: Some(tools.into_iter().map(ToolDefinition::from).collect()), .. };
 //! ```
 //!
 //! ## Error Handling
@@ -171,6 +147,8 @@ pub mod provider;
 pub mod providers;
 pub mod rig_adapter;
 
+pub mod cache;
+pub mod codec;
 pub mod token_metrics;
 pub mod types;
 

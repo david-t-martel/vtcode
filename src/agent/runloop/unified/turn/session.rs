@@ -493,6 +493,7 @@ pub(crate) async fn run_single_agent_loop_unified(
         }
 
         loop {
+            handle.set_agent_state(vtcode_core::ui::state::AgentState::Idle);
             if let Err(error) = update_input_status_if_changed(
                 &handle,
                 &config.workspace,
@@ -1098,6 +1099,7 @@ pub(crate) async fn run_single_agent_loop_unified(
                     input_status_state.right.clone(),
                     "Thinking...",
                 );
+                handle.set_agent_state(vtcode_core::ui::state::AgentState::Thinking);
                 task::yield_now().await;
                 #[cfg(debug_assertions)]
                 let request_timer = Instant::now();
@@ -1449,6 +1451,8 @@ pub(crate) async fn run_single_agent_loop_unified(
                                     .set_message(format!("Starting {}...", name))
                                     .await;
 
+                                handle
+                                    .set_agent_state(vtcode_core::ui::state::AgentState::Executing);
                                 let tool_spinner = PlaceholderSpinner::with_progress(
                                     &handle,
                                     input_status_state.left.clone(),

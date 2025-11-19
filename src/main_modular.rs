@@ -19,6 +19,7 @@ use vtcode_core::{
     safety::SafetyValidator,
     types::{AgentConfig as CoreAgentConfig, ModelSelectionSource},
 };
+use vtcode_core::llm::cache::LLMCacheConfig;
 
 mod cli;
 
@@ -179,6 +180,7 @@ async fn main() -> Result<()> {
             let client = vtcode_core::llm::make_client(
                 config.api_key.clone(),
                 config.model.parse().unwrap_or_default(),
+                LLMCacheConfig::default(),
             );
 
             // For a minimal implementation, we'll just print a placeholder response

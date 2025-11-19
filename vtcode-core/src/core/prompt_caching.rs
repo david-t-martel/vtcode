@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
+use tracing::debug;
 
 /// Cached prompt entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +76,8 @@ pub struct PromptCache {
     config: PromptCacheConfig,
     cache: HashMap<String, CachedPrompt>,
     dirty: bool,
+    cache_hits: u64,
+    cache_misses: u64,
 }
 
 impl PromptCache {
@@ -87,6 +90,8 @@ impl PromptCache {
             config,
             cache: HashMap::new(),
             dirty: false,
+            cache_hits: 0,
+            cache_misses: 0,
         };
 
         // Load existing cache
@@ -111,8 +116,10 @@ impl PromptCache {
             entry.last_used = Self::current_timestamp();
             entry.usage_count += 1;
             self.dirty = true;
+            self.cache_hits += 1;
             Some(entry)
         } else {
+            self.cache_misses += 1;
             None
         }
     }
@@ -167,12 +174,27 @@ impl PromptCache {
             0.0
         };
 
-        CacheStats {
+        let stats = CacheStats {
             total_entries,
             total_usage,
             total_tokens_saved,
             avg_quality,
-        }
+            cache_hits: self.cache_hits,
+            cache_misses: self.cache_misses,
+        };
+
+        debug!(
+            target: "vtcode::prompt_cache",
+            entries = stats.total_entries,
+            hits = stats.cache_hits,
+            misses = stats.cache_misses,
+            total_usage = stats.total_usage,
+            tokens_saved = stats.total_tokens_saved,
+            avg_quality = stats.avg_quality,
+            "prompt cache stats"
+        );
+
+        stats
     }
 
     /// Clear all cache entries
@@ -292,6 +314,8 @@ pub struct CacheStats {
     pub total_usage: u32,
     pub total_tokens_saved: u32,
     pub avg_quality: f64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
 }
 
 impl Default for CacheStats {
@@ -301,6 +325,8 @@ impl Default for CacheStats {
             total_usage: 0,
             total_tokens_saved: 0,
             avg_quality: 0.0,
+            cache_hits: 0,
+            cache_misses: 0,
         }
     }
 }
@@ -461,9 +487,7 @@ impl PromptOptimizer {
             .await
             .map_err(|e| PromptOptimizationError::LLMError(e.to_string()))?;
 
-        Ok(response
-            .content
-            .unwrap_or_else(|| original_prompt.to_string()))
+        Ok(response.content)
     }
 
     /// Estimate token count (rough approximation)
@@ -528,6 +552,10 @@ mod tests {
         let retrieved = cache.get("test_hash");
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().usage_count, 1);
+
+        let stats = cache.stats();
+        assert_eq!(stats.cache_hits, 1);
+        assert_eq!(stats.cache_misses, 0);
     }
 
     #[tokio::test]
@@ -559,5 +587,7 @@ mod tests {
         cache.put(entry).unwrap();
         assert!(!cache.contains("noop"));
         assert_eq!(cache.stats().total_entries, 0);
+        assert_eq!(cache.stats().cache_hits, 0);
+        assert_eq!(cache.stats().cache_misses, 0);
     }
 }

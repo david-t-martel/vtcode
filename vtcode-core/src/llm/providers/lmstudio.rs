@@ -5,9 +5,10 @@ use crate::config::constants::{env_vars, models, urls};
 use crate::config::core::PromptCachingConfig;
 use crate::llm::client::LLMClient;
 use crate::llm::error_display;
-use crate::llm::provider::{LLMError, LLMProvider, LLMRequest, LLMResponse, LLMStream};
+use crate::llm::provider::{LLMProvider, LLMRequest, LLMStream};
 use crate::llm::providers::common::override_base_url;
 use crate::llm::types as llm_types;
+use crate::llm::types::{LLMError, LLMResponse};
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -159,12 +160,16 @@ impl LLMProvider for LmStudioProvider {
         self.inner.supports_parallel_tool_config(model)
     }
 
+    fn supports_structured_output(&self, model: &str) -> bool {
+        self.inner.supports_structured_output(model)
+    }
+
     async fn generate(&self, request: LLMRequest) -> Result<LLMResponse, LLMError> {
         self.inner.generate(request).await
     }
 
     async fn stream(&self, request: LLMRequest) -> Result<LLMStream, LLMError> {
-        self.inner.stream(request).await
+        LLMClient::stream(&self.inner, request).await
     }
 
     fn supported_models(&self) -> Vec<String> {
@@ -207,6 +212,13 @@ impl LLMProvider for LmStudioProvider {
 impl LLMClient for LmStudioProvider {
     async fn generate(&mut self, prompt: &str) -> Result<llm_types::LLMResponse, LLMError> {
         LLMClient::generate(&mut self.inner, prompt).await
+    }
+
+    async fn stream(
+        &self,
+        request: llm_types::LLMRequest,
+    ) -> Result<llm_types::LLMStream, LLMError> {
+        <OpenAIProvider as LLMClient>::stream(&self.inner, request).await
     }
 
     fn backend_kind(&self) -> llm_types::BackendKind {

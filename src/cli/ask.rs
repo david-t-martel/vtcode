@@ -41,15 +41,13 @@ fn classify_request_mode(provider_supports_streaming: bool) -> AskRequestMode {
 
 fn print_final_response(printed_any: bool, response: Option<LLMResponse>) {
     if let Some(response) = response {
-        match (printed_any, response.content) {
-            (false, Some(content)) => println!("{}", content),
-            (true, Some(content)) => {
+        match (printed_any, response.content.as_str()) {
+            (false, content) => println!("{}", content),
+            (true, content) => {
                 if !content.ends_with('\n') {
                     println!();
                 }
             }
-            (true, None) => println!(),
-            (false, None) => {}
         }
     }
 }
@@ -206,7 +204,7 @@ fn emit_json_response(
     payload.insert("model".to_string(), json!(config.model));
     payload.insert(
         "content".to_string(),
-        json!(response.content.unwrap_or_default()),
+        json!(response.content.clone()),
     );
     payload.insert(
         "finish_reason".to_string(),
@@ -267,7 +265,9 @@ fn finish_reason_json(reason: &FinishReason) -> Value {
     match reason {
         FinishReason::Stop => json!({ "type": "stop" }),
         FinishReason::Length => json!({ "type": "length" }),
-        FinishReason::ToolCalls => json!({ "type": "tool_calls" }),
+        FinishReason::ToolCalls | FinishReason::FunctionCall => {
+            json!({ "type": "tool_calls" })
+        }
         FinishReason::ContentFilter => json!({ "type": "content_filter" }),
         FinishReason::Error(message) => json!({ "type": "error", "message": message }),
     }

@@ -95,12 +95,11 @@ This section outlines a detailed plan to implement the recommended improvements 
 
 ### Phase 2: Performance Improvements
 
-2.  **Intelligent Caching for LLM Responses:**
-    *   **Subtask 2.1:** Design a caching strategy (e.g., in-memory, disk-backed, semantic hashing).
-    *   **Subtask 2.2:** Implement a cache layer in `vtcode-llm` or `vtcode-core` to store LLM responses.
-    *   **Subtask 2.3:** Develop a mechanism to generate cache keys based on prompt content and context.
-    *   **Subtask 2.4:** Integrate cache lookup and storage into the LLM interaction flow.
-    *   **Subtask 2.5:** Add configuration options for cache size, eviction policy, and persistence.
+2.  **Enhance Existing Prompt Cache:**
+    *   **Subtask 2.1:** Audit the current `PromptCache` (already implemented) for hit-rate stats and eviction behavior.
+    *   **Subtask 2.2:** Expose cache metrics (hits, misses, bytes) to telemetry/logging.
+    *   **Subtask 2.3:** Add config flags for cache warmup/priming and quality-threshold tuning.
+    *   **Subtask 2.4:** Surface cache controls (clear/show stats) in the TUI/CLI.
 3.  **Optimized Context Pruning Strategies:**
     *   **Subtask 3.1:** Research advanced context pruning techniques (e.g., AST-based relevance, code graph analysis).
     *   **Subtask 3.2:** Integrate Tree-sitter output or a code graph representation into the context management module (`vtcode-core`).
@@ -111,12 +110,12 @@ This section outlines a detailed plan to implement the recommended improvements 
     *   **Subtask 4.2:** Ensure all external commands are executed asynchronously using `tokio::spawn` or similar.
     *   **Subtask 4.3:** Implement a standardized way for tools to report progress (e.g., via channels or event streams).
     *   **Subtask 4.4:** Integrate progress reporting into the TUI to display real-time feedback to the user.
-5.  **Pre-computation/Pre-indexing of Codebase:**
-    *   **Subtask 5.1:** Design a background indexing service for `vtcode-indexer`.
-    *   **Subtask 5.2:** Implement logic to parse code using Tree-sitter and extract symbol definitions, references, and call graph information.
-    *   **Subtask 5.3:** Store indexed data efficiently (e.g., in a local database or optimized file format).
-    *   **Subtask 5.4:** Integrate the pre-indexed data into `find_symbol` and `find_referencing_symbols` tools for faster lookups.
-    *   **Subtask 5.5:** Add configuration for indexing frequency and scope.
+5.  **Extend `vtcode-indexer` (already present):**
+    *   **Subtask 5.1:** Add incremental/index-delta mode instead of full rescans.
+    *   **Subtask 5.2:** Persist symbol/refs/call-graph overlays using Tree-sitter outputs.
+    *   **Subtask 5.3:** Optimize storage layout (e.g., mmap/SQLite) and size reporting.
+    *   **Subtask 5.4:** Wire indexed data into `find_symbol` / `find_referencing_symbols` for low-latency queries.
+    *   **Subtask 5.5:** Make indexing frequency/scope configurable per workspace.
 6.  **Lazy Loading of Large File Contents:**
     *   **Subtask 6.1:** Identify areas in the TUI where large file contents are displayed (e.g., search results, file viewer).
     *   **Subtask 6.2:** Implement a mechanism to load file content in chunks or on demand as the user scrolls.
@@ -180,11 +179,11 @@ This section outlines a detailed plan to implement the recommended improvements 
     *   **Subtask 18.1:** Automate the build and packaging process for macOS, Linux, and Windows.
     *   **Subtask 18.2:** Integrate an auto-update mechanism (e.g., using `self_update` crate or similar) into the `vtcode` binary.
     *   **Subtask 18.3:** Ensure smooth update experience with rollback capabilities.
-19. **Version Control Integration (Git):**
-    *   **Subtask 19.1:** Integrate `git2-rs` or similar Rust Git libraries into `vtcode-core`.
-    *   **Subtask 19.2:** Implement commands for `git status`, `git add`, `git commit`, `git diff` within the TUI.
-    *   **Subtask 19.3:** Develop intelligent suggestions for commit messages based on agent-made changes.
-    *   **Subtask 19.4:** Provide visual diffs of changes directly in the TUI.
+19. **Git Staging/Commit UX (status/diff already implemented):**
+    *   **Subtask 19.1:** Integrate `git2-rs` (or shell fallback) to stage files and create commits from the TUI.
+    *   **Subtask 19.2:** Add visual staging cues and inline diffs for selected files.
+    *   **Subtask 19.3:** Suggest commit messages based on agent-made changes and user context.
+    *   **Subtask 19.4:** Support basic rollback (reset selected files) from the UI.
 20. **Telemetry Opt-in for Usage Analytics:**
     *   **Subtask 20.1:** Implement an *opt-in* mechanism for telemetry, clearly explaining what data is collected.
     *   **Subtask 20.2:** Integrate a lightweight analytics library to collect anonymous usage data (e.g., command usage, feature adoption).

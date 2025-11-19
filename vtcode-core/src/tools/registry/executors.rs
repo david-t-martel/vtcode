@@ -149,7 +149,9 @@ impl ToolRegistry {
                     for message in listing.snapshot.messages {
                         // Check assistant messages for error-like content
                         if message.role == crate::llm::provider::MessageRole::Assistant {
-                            let text = message.content.as_text();
+                            let Some(text) = message.content.as_text() else {
+                                continue;
+                            };
                             let lower = text.to_lowercase();
 
                             // Enhanced error detection patterns

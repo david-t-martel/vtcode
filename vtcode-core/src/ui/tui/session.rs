@@ -65,6 +65,7 @@ use crate::prompts::CustomPromptRegistry;
 #[cfg(test)]
 use crate::tools::PlanSummary;
 use crate::tools::TaskPlan;
+use crate::ui::state::AgentState;
 
 const USER_PREFIX: &str = "";
 const PLACEHOLDER_COLOR: RgbColor = RgbColor(0x88, 0x88, 0x88);
@@ -75,6 +76,9 @@ const LEGACY_PROMPT_INVOKE_PREFIX: &str = "prompts:";
 const PROMPT_COMMAND_PREFIX: &str = "/prompt:";
 
 pub struct Session {
+    // --- Agent State ---
+    agent_state: AgentState,
+
     // --- Managers (Phase 2) ---
     /// Manages user input, cursor, and command history
     input_manager: InputManager,
@@ -149,6 +153,9 @@ impl Session {
         let initial_transcript_rows = resolved_rows.saturating_sub(reserved_rows).max(1);
 
         let mut session = Self {
+            // --- Agent State ---
+            agent_state: AgentState::Idle,
+
             // --- Managers (Phase 2) ---
             input_manager: InputManager::new(),
             scroll_manager: ScrollManager::new(initial_transcript_rows),
@@ -268,6 +275,10 @@ impl Session {
             }
             InlineCommand::SetPlan { plan } => {
                 self.set_plan(plan);
+            }
+            InlineCommand::SetAgentState(state) => {
+                self.agent_state = state;
+                self.needs_redraw = true;
             }
             InlineCommand::SetCursorVisible(value) => {
                 self.cursor_visible = value;
@@ -467,6 +478,7 @@ impl Session {
         } else {
             0
         };
+        let status_bar_height = 1;
         let inner_width = viewport.width.saturating_sub(2);
         let desired_lines = self.desired_input_lines(inner_width);
         let block_height = Self::input_block_height_for_lines(desired_lines);
@@ -475,13 +487,16 @@ impl Session {
 
         let mut constraints = vec![Constraint::Length(header_height), Constraint::Min(1)];
         constraints.push(Constraint::Length(input_height));
+        constraints.push(Constraint::Length(status_bar_height));
 
         let segments = Layout::vertical(constraints).split(viewport);
 
         let header_area = segments[0];
         let main_area = segments[1];
-        let input_index = segments.len().saturating_sub(1);
+        let input_index = segments.len().saturating_sub(2);
+        let status_bar_index = segments.len().saturating_sub(1);
         let input_area = segments[input_index];
+        let status_bar_area = segments[status_bar_index];
 
         let available_width = main_area.width;
         let horizontal_minimum = ui::INLINE_CONTENT_MIN_WIDTH + ui::INLINE_NAVIGATION_MIN_WIDTH;
@@ -520,10 +535,19 @@ impl Session {
         }
         self.render_transcript(frame, transcript_area);
         self.render_input(frame, input_area);
+        self.render_status_bar(frame, status_bar_area);
         self.render_modal(frame, viewport);
         self.render_slash_palette(frame, viewport);
         self.render_file_palette(frame, viewport);
         self.render_prompt_palette(frame, viewport);
+    }
+
+    fn render_status_bar(&self, frame: &mut Frame<'_>, area: Rect) {
+        let status_text = self.agent_state.to_string();
+        let status_bar = Paragraph::new(status_text)
+            .style(self.default_style())
+            .alignment(ratatui::layout::Alignment::Left);
+        frame.render_widget(status_bar, area);
     }
 
     fn set_plan(&mut self, plan: TaskPlan) {

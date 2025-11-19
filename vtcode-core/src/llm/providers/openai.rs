@@ -6,11 +6,12 @@ use crate::config::types::ReasoningEffortLevel;
 use crate::llm::client::LLMClient;
 use crate::llm::error_display;
 use crate::llm::provider::{
-    FinishReason, LLMError, LLMProvider, LLMRequest, LLMResponse, LLMStream, LLMStreamEvent,
-    Message, MessageContent, MessageRole, ToolCall, ToolChoice, ToolDefinition,
+    LLMProvider, LLMRequest, LLMStream, LLMStreamEvent, Message, MessageContent, MessageRole,
+    ToolChoice,
 };
 use crate::llm::rig_adapter::reasoning_parameters_for;
 use crate::llm::types as llm_types;
+use crate::llm::types::{FinishReason, LLMError, LLMResponse, ToolCall, ToolDefinition, Tool, Function};
 use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -114,6 +115,7 @@ fn is_responses_api_unsupported(status: StatusCode, body: &str) -> bool {
 fn parse_responses_payload(
     response_json: Value,
     include_cached_prompt_metrics: bool,
+    model: &str,
 ) -> Result<LLMResponse, LLMError> {
     let output = response_json
         .get("output")
@@ -229,26 +231,26 @@ fn parse_responses_payload(
                 .and_then(|details| details.get("cached_tokens"))
                 .or_else(|| usage_value.get("prompt_cache_hit_tokens"))
                 .and_then(|value| value.as_u64())
-                .map(|value| value as u32)
+                .map(|value| value as usize)
         } else {
             None
         };
 
-        crate::llm::provider::Usage {
+        crate::llm::types::Usage {
             prompt_tokens: usage_value
                 .get("input_tokens")
                 .or_else(|| usage_value.get("prompt_tokens"))
                 .and_then(|pt| pt.as_u64())
-                .unwrap_or(0) as u32,
+                .unwrap_or(0) as usize,
             completion_tokens: usage_value
                 .get("output_tokens")
                 .or_else(|| usage_value.get("completion_tokens"))
                 .and_then(|ct| ct.as_u64())
-                .unwrap_or(0) as u32,
+                .unwrap_or(0) as usize,
             total_tokens: usage_value
                 .get("total_tokens")
                 .and_then(|tt| tt.as_u64())
-                .unwrap_or(0) as u32,
+                .unwrap_or(0) as usize,
             cached_prompt_tokens,
             cache_creation_tokens: None,
             cache_read_tokens: None,
@@ -273,7 +275,8 @@ fn parse_responses_payload(
     };
 
     Ok(LLMResponse {
-        content,
+        content: content.unwrap_or_default(),
+        model: model.to_string(),
         tool_calls,
         usage,
         finish_reason,
@@ -397,16 +400,12 @@ impl OpenAIProvider {
         let mut developer_message = request.tools.as_ref().and_then(|tools| {
             let tool_descriptions: Vec<ToolDescription> = tools
                 .iter()
-                .filter_map(|tool| {
-                    if tool.tool_type != "function" {
-                        return None;
-                    }
-
-                    Some(ToolDescription::new(
-                        tool.function.as_ref().unwrap().name.clone(),
-                        tool.function.as_ref().unwrap().description.clone(),
-                        Some(tool.function.as_ref().unwrap().parameters.clone()),
-                    ))
+                .map(|tool| {
+                    ToolDescription::new(
+                        tool.function.name.clone(),
+                        tool.function.description.clone(),
+                        Some(tool.function.parameters.clone()),
+                    )
                 })
                 .collect();
 
@@ -434,28 +433,27 @@ impl OpenAIProvider {
                 MessageRole::System => {
                     harmony_messages.push(HarmonyMessage::from_role_and_content(
                         HarmonyRole::System,
-                        msg.content.as_text(),
+                        msg.content.as_text().unwrap_or_default(),
                     ));
                 }
                 MessageRole::User => {
                     harmony_messages.push(HarmonyMessage::from_role_and_content(
                         HarmonyRole::User,
-                        msg.content.as_text(),
+                        msg.content.as_text().unwrap_or_default(),
                     ));
                 }
                 MessageRole::Assistant => {
                     if let Some(tool_calls) = &msg.tool_calls {
                         for call in tool_calls {
-                            if let Some(ref func) = call.function {
-                                tool_call_authors
-                                    .insert(call.id.clone(), format!("functions.{}", func.name));
-                            }
+                            let func = &call.function;
+                            tool_call_authors
+                                .insert(call.id.clone(), format!("functions.{}", func.name));
                         }
                     }
 
                     harmony_messages.push(HarmonyMessage::from_role_and_content(
                         HarmonyRole::Assistant,
-                        msg.content.as_text(),
+                        msg.content.as_text().unwrap_or_default(),
                     ));
                 }
                 MessageRole::Tool => {
@@ -472,7 +470,7 @@ impl OpenAIProvider {
 
                     harmony_messages.push(HarmonyMessage::from_author_and_content(
                         author,
-                        msg.content.as_text(),
+                        msg.content.as_text().unwrap_or_default(),
                     ));
                 }
             }
@@ -738,11 +736,14 @@ impl OpenAIProvider {
                         .get("parameters")
                         .cloned()
                         .unwrap_or_else(|| json!({}));
-                    Some(ToolDefinition::function(
-                        name.to_string(),
-                        description,
-                        parameters,
-                    ))
+
+                    Some(Tool {
+                        function: Function {
+                            name: name.to_string(),
+                            description,
+                            parameters,
+                        },
+                    })
                 })
                 .collect();
 
@@ -825,9 +826,9 @@ impl OpenAIProvider {
     fn parse_tool_choice(choice: &Value) -> Option<ToolChoice> {
         match choice {
             Value::String(value) => match value.as_str() {
-                "auto" => Some(ToolChoice::auto()),
-                "none" => Some(ToolChoice::none()),
-                "required" => Some(ToolChoice::any()),
+                "auto" => Some(ToolChoice::Auto),
+                "none" => Some(ToolChoice::None),
+                "required" => Some(ToolChoice::Any),
                 _ => None,
             },
             Value::Object(map) => {
@@ -837,10 +838,10 @@ impl OpenAIProvider {
                         .get("function")
                         .and_then(|f| f.get("name"))
                         .and_then(|n| n.as_str())
-                        .map(|name| ToolChoice::function(name.to_string())),
-                    "auto" => Some(ToolChoice::auto()),
-                    "none" => Some(ToolChoice::none()),
-                    "any" | "required" => Some(ToolChoice::any()),
+                        .map(|name| ToolChoice::Tool(name.to_string())),
+                    "auto" => Some(ToolChoice::Auto),
+                    "none" => Some(ToolChoice::None),
+                    "any" | "required" => Some(ToolChoice::Any),
                     _ => None,
                 }
             }
@@ -873,17 +874,16 @@ impl OpenAIProvider {
                         let tool_calls_json: Vec<Value> = tool_calls
                             .iter()
                             .filter_map(|tc| {
-                                tc.function.as_ref().map(|func| {
-                                    active_tool_call_ids.insert(tc.id.clone());
-                                    json!({
-                                        "id": tc.id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": func.name,
-                                            "arguments": func.arguments
-                                        }
-                                    })
-                                })
+                                let func = &tc.function;
+                                active_tool_call_ids.insert(tc.id.clone());
+                                Some(json!({
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": func.name,
+                                        "arguments": func.arguments
+                                    }
+                                }))
                             })
                             .collect();
                         message["tool_calls"] = Value::Array(tool_calls_json);
@@ -931,12 +931,13 @@ impl OpenAIProvider {
 
         if self.supports_tools(&request.model) {
             if let Some(tools) = &request.tools {
-                if let Some(serialized) = Self::serialize_tools(tools) {
+                let defs: Vec<ToolDefinition> = tools.iter().map(ToolDefinition::from).collect();
+                if let Some(serialized) = Self::serialize_tools(&defs) {
                     openai_request["tools"] = serialized;
 
                     // Check if any tools are custom types - if so, disable parallel tool calls
                     // as per GPT-5 specification: "custom tool type does NOT support parallel tool calling"
-                    let has_custom_tool = tools.iter().any(|tool| tool.tool_type == "custom");
+                    let has_custom_tool = defs.iter().any(|tool| tool.tool_type == "custom");
                     if has_custom_tool {
                         // Override parallel tool calls to false if custom tools are present
                         openai_request["parallel_tool_calls"] = Value::Bool(false);
@@ -1011,12 +1012,13 @@ impl OpenAIProvider {
 
         if self.supports_tools(&request.model) {
             if let Some(tools) = &request.tools {
-                if let Some(serialized) = Self::serialize_tools(tools) {
+                let defs: Vec<ToolDefinition> = tools.iter().map(ToolDefinition::from).collect();
+                if let Some(serialized) = Self::serialize_tools(&defs) {
                     openai_request["tools"] = serialized;
 
                     // Check if any tools are custom types - if so, disable parallel tool calls
                     // as per GPT-5 specification: "custom tool type does NOT support parallel tool calling"
-                    let has_custom_tool = tools.iter().any(|tool| tool.tool_type == "custom");
+                    let has_custom_tool = defs.iter().any(|tool| tool.tool_type == "custom");
                     if has_custom_tool {
                         // Override parallel tool calls to false if custom tools are present
                         openai_request["parallel_tool_calls"] = Value::Bool(false);
@@ -1082,26 +1084,11 @@ impl OpenAIProvider {
             has_format_options = true;
         }
 
-        // Add grammar constraint if tools include grammar definitions
-        if let Some(ref tools) = request.tools {
-            let grammar_tools: Vec<&ToolDefinition> = tools
-                .iter()
-                .filter(|tool| tool.tool_type == "grammar")
-                .collect();
-
-            if !grammar_tools.is_empty() {
-                // Use the first grammar definition found
-                if let Some(grammar_tool) = grammar_tools.first() {
-                    if let Some(ref grammar) = grammar_tool.grammar {
-                        text_format["format"] = json!({
-                            "type": "grammar",
-                            "syntax": grammar.syntax,
-                            "definition": grammar.definition
-                        });
-                        has_format_options = true;
-                    }
-                }
-            }
+        // Add grammar constraint if tools include grammar definitions.
+        // With the unified `Tool` type, grammar-only tools are not yet modeled,
+        // so this block is intentionally disabled until that support is added.
+        if let Some(_tools) = &request.tools {
+            // TODO: map grammar-style tools into a structured text_format when available.
         }
 
         // Set default verbosity for GPT-5.1 models if no format options specified
@@ -1157,17 +1144,16 @@ impl OpenAIProvider {
             LLMError::Provider(formatted_error)
         })?;
 
-        let content = match message.get("content") {
-            Some(Value::String(text)) => Some(text.to_string()),
+        let content_text = match message.get("content") {
+            Some(Value::String(text)) => text.to_string(),
             Some(Value::Array(parts)) => {
-                let text = parts
+                parts
                     .iter()
                     .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
                     .collect::<Vec<_>>()
-                    .join("");
-                if text.is_empty() { None } else { Some(text) }
+                    .join("")
             }
-            _ => None,
+            _ => String::new(),
         };
 
         let tool_calls = message
@@ -1221,41 +1207,50 @@ impl OpenAIProvider {
             })
             .unwrap_or(FinishReason::Stop);
 
-        Ok(LLMResponse {
-            content,
-            tool_calls,
-            usage: response_json.get("usage").map(|usage_value| {
-                let cached_prompt_tokens =
-                    if self.prompt_cache_enabled && self.prompt_cache_settings.surface_metrics {
-                        usage_value
-                            .get("prompt_tokens_details")
-                            .and_then(|details| details.get("cached_tokens"))
-                            .and_then(|value| value.as_u64())
-                            .map(|value| value as u32)
-                    } else {
-                        None
-                    };
+        let usage = response_json.get("usage").map(|usage_value| {
+            let cached_prompt_tokens =
+                if self.prompt_cache_enabled && self.prompt_cache_settings.surface_metrics {
+                    usage_value
+                        .get("prompt_tokens_details")
+                        .and_then(|details| details.get("cached_tokens"))
+                        .and_then(|value| value.as_u64())
+                        .map(|value| value as usize)
+                } else {
+                    None
+                };
 
-                crate::llm::provider::Usage {
-                    prompt_tokens: usage_value
-                        .get("prompt_tokens")
-                        .and_then(|pt| pt.as_u64())
-                        .unwrap_or(0) as u32,
-                    completion_tokens: usage_value
-                        .get("completion_tokens")
-                        .and_then(|ct| ct.as_u64())
-                        .unwrap_or(0) as u32,
-                    total_tokens: usage_value
-                        .get("total_tokens")
-                        .and_then(|tt| tt.as_u64())
-                        .unwrap_or(0) as u32,
-                    cached_prompt_tokens,
-                    cache_creation_tokens: None,
-                    cache_read_tokens: None,
-                }
-            }),
-            finish_reason,
+            llm_types::Usage {
+                prompt_tokens: usage_value
+                    .get("prompt_tokens")
+                    .and_then(|pt| pt.as_u64())
+                    .unwrap_or(0) as usize,
+                completion_tokens: usage_value
+                    .get("completion_tokens")
+                    .and_then(|ct| ct.as_u64())
+                    .unwrap_or(0) as usize,
+                total_tokens: usage_value
+                    .get("total_tokens")
+                    .and_then(|tt| tt.as_u64())
+                    .unwrap_or(0) as usize,
+                cached_prompt_tokens,
+                cache_creation_tokens: None,
+                cache_read_tokens: None,
+            }
+        });
+
+        let model = response_json
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or(&self.model)
+            .to_string();
+
+        Ok(LLMResponse {
+            content: content_text,
+            model,
+            usage,
             reasoning,
+            tool_calls,
+            finish_reason,
             reasoning_details: None,
         })
     }
@@ -1266,7 +1261,7 @@ impl OpenAIProvider {
     ) -> Result<LLMResponse, LLMError> {
         let include_metrics =
             self.prompt_cache_enabled && self.prompt_cache_settings.surface_metrics;
-        parse_responses_payload(response_json, include_metrics)
+        parse_responses_payload(response_json, include_metrics, &self.model)
     }
 
     async fn generate_with_harmony(&self, request: LLMRequest) -> Result<LLMResponse, LLMError> {
@@ -1419,12 +1414,13 @@ impl OpenAIProvider {
         };
 
         Ok(LLMResponse {
-            content,
+            model: request.model.clone(),
+            content: content.unwrap_or_default(),
             tool_calls,
-            usage: Some(crate::llm::provider::Usage {
-                prompt_tokens: prompt_tokens.len() as u32,
-                completion_tokens: completion_tokens.len() as u32,
-                total_tokens: (prompt_tokens.len() + completion_tokens.len()) as u32,
+            usage: Some(crate::llm::types::Usage {
+                prompt_tokens: prompt_tokens.len(),
+                completion_tokens: completion_tokens.len(),
+                total_tokens: prompt_tokens.len() + completion_tokens.len(),
                 cached_prompt_tokens: None,
                 cache_creation_tokens: None,
                 cache_read_tokens: None,
@@ -1518,7 +1514,7 @@ impl OpenAIProvider {
                         server_url, e
                     ),
                 );
-                LLMError::Network(formatted_error)
+                LLMError::NetworkError(formatted_error)
             })?;
 
         // Check response status
@@ -2048,10 +2044,11 @@ fn build_standard_responses_payload(
     for msg in &request.messages {
         match msg.role {
             MessageRole::System => {
-                let content_text = msg.content.as_text();
-                let trimmed = content_text.trim();
-                if !trimmed.is_empty() {
-                    instructions_segments.push(trimmed.to_string());
+                if let Some(content_text) = msg.content.as_text() {
+                    let trimmed = content_text.trim();
+                    if !trimmed.is_empty() {
+                        instructions_segments.push(trimmed.to_string());
+                    }
                 }
             }
             MessageRole::User => {
@@ -2074,17 +2071,16 @@ fn build_standard_responses_payload(
 
                 if let Some(tool_calls) = &msg.tool_calls {
                     for call in tool_calls {
-                        if let Some(ref func) = call.function {
-                            active_tool_call_ids.insert(call.id.clone());
-                            content_parts.push(json!({
-                                "type": "tool_call",
-                                "id": call.id.clone(),
-                                "function": {
-                                    "name": func.name.clone(),
-                                    "arguments": func.arguments.clone()
-                                }
-                            }));
-                        }
+                        let func = &call.function;
+                        active_tool_call_ids.insert(call.id.clone());
+                        content_parts.push(json!({
+                            "type": "tool_call",
+                            "id": call.id.clone(),
+                            "function": {
+                                "name": func.name.clone(),
+                                "arguments": func.arguments.clone()
+                            }
+                        }));
                     }
                 }
 
@@ -2109,12 +2105,13 @@ fn build_standard_responses_payload(
                 }
 
                 let mut tool_content = Vec::new();
-                let content_text = msg.content.as_text();
-                if !content_text.trim().is_empty() {
-                    tool_content.push(json!({
-                        "type": "output_text",
-                        "text": content_text
-                    }));
+                if let Some(content_text) = msg.content.as_text() {
+                    if !content_text.trim().is_empty() {
+                        tool_content.push(json!({
+                            "type": "output_text",
+                            "text": content_text
+                        }));
+                    }
                 }
 
                 let mut tool_result = json!({
@@ -2166,10 +2163,11 @@ fn build_codex_responses_payload(request: &LLMRequest) -> Result<OpenAIResponses
     for msg in &request.messages {
         match msg.role {
             MessageRole::System => {
-                let content_text = msg.content.as_text();
-                let trimmed = content_text.trim();
-                if !trimmed.is_empty() {
-                    additional_guidance.push(trimmed.to_string());
+                if let Some(content_text) = msg.content.as_text() {
+                    let trimmed = content_text.trim();
+                    if !trimmed.is_empty() {
+                        additional_guidance.push(trimmed.to_string());
+                    }
                 }
             }
             MessageRole::User => {
@@ -2192,17 +2190,16 @@ fn build_codex_responses_payload(request: &LLMRequest) -> Result<OpenAIResponses
 
                 if let Some(tool_calls) = &msg.tool_calls {
                     for call in tool_calls {
-                        if let Some(ref func) = call.function {
-                            active_tool_call_ids.insert(call.id.clone());
-                            content_parts.push(json!({
-                                "type": "tool_call",
-                                "id": call.id.clone(),
-                                "function": {
-                                    "name": func.name.clone(),
-                                    "arguments": func.arguments.clone()
-                                }
-                            }));
-                        }
+                        let func = &call.function;
+                        active_tool_call_ids.insert(call.id.clone());
+                        content_parts.push(json!({
+                            "type": "tool_call",
+                            "id": call.id.clone(),
+                            "function": {
+                                "name": func.name.clone(),
+                                "arguments": func.arguments.clone()
+                            }
+                        }));
                     }
                 }
 
@@ -2227,12 +2224,13 @@ fn build_codex_responses_payload(request: &LLMRequest) -> Result<OpenAIResponses
                 }
 
                 let mut tool_content = Vec::new();
-                let content_text = msg.content.as_text();
-                if !content_text.trim().is_empty() {
-                    tool_content.push(json!({
-                        "type": "output_text",
-                        "text": content_text
-                    }));
+                if let Some(content_text) = msg.content.as_text() {
+                    if !content_text.trim().is_empty() {
+                        tool_content.push(json!({
+                            "type": "output_text",
+                            "text": content_text
+                        }));
+                    }
                 }
 
                 let mut tool_result = json!({
@@ -2323,6 +2321,21 @@ impl LLMProvider for OpenAIProvider {
             .any(|candidate| *candidate == requested)
     }
 
+    fn supports_parallel_tool_config(&self, model: &str) -> bool {
+        // Parallel tool calls are available when the Responses API is allowed or required.
+        // Disable when Responses is explicitly unsupported for the requested model.
+        !matches!(self.responses_api_state(model), ResponsesApiState::Disabled)
+    }
+
+    fn supports_structured_output(&self, model: &str) -> bool {
+        // OpenAI structured outputs (JSON schema) are tied to the Responses API; enable when
+        // the API is allowed or required for the target model.
+        matches!(
+            self.responses_api_state(model),
+            ResponsesApiState::Allowed | ResponsesApiState::Required
+        )
+    }
+
     async fn stream(&self, mut request: LLMRequest) -> Result<LLMStream, LLMError> {
         if request.model.trim().is_empty() {
             request.model = self.model.clone();
@@ -2348,6 +2361,8 @@ impl LLMProvider for OpenAIProvider {
 
         let include_metrics =
             self.prompt_cache_enabled && self.prompt_cache_settings.surface_metrics;
+
+        let stream_model = self.model.clone();
 
         let mut openai_request = self.convert_to_openai_responses_format(&request)?;
         openai_request["stream"] = Value::Bool(true);
@@ -2379,7 +2394,7 @@ impl LLMProvider for OpenAIProvider {
             .map_err(|e| {
                 let formatted_error =
                     error_display::format_llm_error("OpenAI", &format!("Network error: {}", e));
-                LLMError::Network(formatted_error)
+                LLMError::NetworkError(formatted_error)
             })?;
 
         if !response.status().is_success() {
@@ -2474,7 +2489,7 @@ impl LLMProvider for OpenAIProvider {
                         "OpenAI",
                         &format!("Streaming error: {}", err),
                     );
-                    LLMError::Network(formatted_error)
+                    LLMError::NetworkError(formatted_error)
                 })?;
 
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
@@ -2600,14 +2615,18 @@ impl LLMProvider for OpenAIProvider {
                 }
             };
 
-            let mut response = parse_responses_payload(response_value, include_metrics)?;
-
-            if response.content.is_none() && !aggregated_content.is_empty() {
-                response.content = Some(aggregated_content.clone());
-            }
+        let mut response = parse_responses_payload(response_value, include_metrics, &stream_model)?;
 
             if let Some(reasoning_text) = reasoning_buffer.finalize() {
-                response.reasoning = Some(reasoning_text);
+                match &mut response.reasoning {
+                    Some(existing) if !existing.is_empty() => {
+                        existing.push('\n');
+                        existing.push_str(&reasoning_text);
+                    }
+                    _ => {
+                        response.reasoning = Some(reasoning_text);
+                    }
+                }
             }
 
             #[cfg(debug_assertions)]
@@ -2675,7 +2694,7 @@ impl LLMProvider for OpenAIProvider {
                 .map_err(|e| {
                     let formatted_error =
                         error_display::format_llm_error("OpenAI", &format!("Network error: {}", e));
-                    LLMError::Network(formatted_error)
+                    LLMError::NetworkError(formatted_error)
                 })?;
 
             if !response.status().is_success() {
@@ -2723,7 +2742,7 @@ impl LLMProvider for OpenAIProvider {
                                         "OpenAI",
                                         &format!("Network error: {}", e),
                                     );
-                                    LLMError::Network(formatted_error)
+                                    LLMError::NetworkError(formatted_error)
                                 })?;
                             if retry_response.status().is_success() {
                                 let openai_response: Value =
@@ -2797,7 +2816,7 @@ impl LLMProvider for OpenAIProvider {
             .map_err(|e| {
                 let formatted_error =
                     error_display::format_llm_error("OpenAI", &format!("Network error: {}", e));
-                LLMError::Network(formatted_error)
+                LLMError::NetworkError(formatted_error)
             })?;
 
         if !response.status().is_success() {
@@ -2885,7 +2904,7 @@ impl LLMClient for OpenAIProvider {
         let response = LLMProvider::generate(self, request).await?;
 
         Ok(llm_types::LLMResponse {
-            content: response.content.unwrap_or_default(),
+            content: response.content,
             model: request_model,
             usage: response.usage.map(|u| llm_types::Usage {
                 prompt_tokens: u.prompt_tokens as usize,
@@ -2896,7 +2915,17 @@ impl LLMClient for OpenAIProvider {
                 cache_read_tokens: u.cache_read_tokens.map(|v| v as usize),
             }),
             reasoning: response.reasoning,
+            tool_calls: response.tool_calls,
+            finish_reason: response.finish_reason,
+            reasoning_details: response.reasoning_details,
         })
+    }
+
+    async fn stream(
+        &self,
+        request: llm_types::LLMRequest,
+    ) -> Result<llm_types::LLMStream, LLMError> {
+        LLMProvider::stream(self, request).await
     }
 
     fn backend_kind(&self) -> llm_types::BackendKind {

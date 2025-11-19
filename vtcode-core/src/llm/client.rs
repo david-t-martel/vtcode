@@ -1,8 +1,10 @@
-use super::provider::LLMError;
+use super::cache::{CachedLLMClient, LLMCacheConfig};
+use super::codec;
 use super::providers::{
     AnthropicProvider, DeepSeekProvider, GeminiProvider, LmStudioProvider, MinimaxProvider,
     MoonshotProvider, OllamaProvider, OpenAIProvider, OpenRouterProvider, XAIProvider, ZAIProvider,
 };
+use super::types::LLMError;
 use super::types::{BackendKind, LLMResponse};
 use crate::config::models::{ModelId, Provider};
 use async_trait::async_trait;
@@ -11,6 +13,17 @@ use async_trait::async_trait;
 #[async_trait]
 pub trait LLMClient: Send + Sync {
     async fn generate(&mut self, prompt: &str) -> Result<LLMResponse, LLMError>;
+    async fn generate_request(
+        &mut self,
+        request: &super::provider::LLMRequest,
+    ) -> Result<LLMResponse, LLMError> {
+        let payload = codec::serialize_request(request)?;
+        self.generate(&payload).await
+    }
+    async fn stream(
+        &self,
+        request: super::provider::LLMRequest,
+    ) -> Result<super::provider::LLMStream, LLMError>;
     fn backend_kind(&self) -> BackendKind;
     fn model_id(&self) -> &str;
 }
@@ -19,8 +32,8 @@ pub trait LLMClient: Send + Sync {
 pub type AnyClient = Box<dyn LLMClient>;
 
 /// Create a client based on the model ID
-pub fn make_client(api_key: String, model: ModelId) -> AnyClient {
-    match model.provider() {
+pub fn make_client(api_key: String, model: ModelId, cache_config: LLMCacheConfig) -> AnyClient {
+    let client: AnyClient = match model.provider() {
         Provider::Gemini => Box::new(GeminiProvider::with_model(
             api_key,
             model.as_str().to_string(),
@@ -62,5 +75,11 @@ pub fn make_client(api_key: String, model: ModelId) -> AnyClient {
             model.as_str().to_string(),
         )),
         Provider::ZAI => Box::new(ZAIProvider::with_model(api_key, model.as_str().to_string())),
+    };
+
+    if cache_config.enabled {
+        Box::new(CachedLLMClient::new(client, cache_config))
+    } else {
+        client
     }
 }

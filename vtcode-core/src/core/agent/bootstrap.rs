@@ -16,6 +16,7 @@ use crate::config::types::{AgentConfig, SessionInfo};
 
 use crate::core::decision_tracker::DecisionTracker;
 use crate::core::error_recovery::ErrorRecoveryManager;
+use crate::llm::cache::LLMCacheConfig;
 use crate::llm::{AnyClient, make_client};
 use crate::tools::ToolRegistry;
 use crate::tools::tree_sitter::TreeSitterAnalyzer;
@@ -149,7 +150,11 @@ fn create_llm_client(config: &AgentConfig) -> Result<AnyClient> {
         .parse::<ModelId>()
         .with_context(|| format!("Invalid model identifier: {}", config.model))?;
 
-    Ok(make_client(config.api_key.clone(), model_id))
+    Ok(make_client(
+        config.api_key.clone(),
+        model_id,
+        LLMCacheConfig::default(),
+    ))
 }
 
 fn create_session_info() -> Result<SessionInfo> {

@@ -4,13 +4,21 @@ use tokio::sync::mpsc;
 use crate::config::types::UiSurfacePreference;
 
 mod session;
+
 mod style;
+
 mod theme_parser;
+
+pub mod state;
+
+pub mod types;
+
 mod tui;
-mod types;
 
 pub use style::{convert_style, theme_from_styles};
+
 pub use theme_parser::ThemeConfigParser;
+
 pub use types::{
     InlineCommand, InlineEvent, InlineEventCallback, InlineHandle, InlineHeaderContext,
     InlineHeaderHighlight, InlineListItem, InlineListSearchConfig, InlineListSelection,

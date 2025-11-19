@@ -496,7 +496,17 @@ impl ZedAgent {
     fn resolved_messages(&self, session: &SessionHandle) -> Vec<Message> {
         let mut messages = Vec::new();
         if !self.system_prompt.trim().is_empty() {
-            messages.push(Message::system(self.system_prompt.clone()));
+            messages.push(Message {
+                role: vtcode_core::llm::provider::MessageRole::System,
+                content: vtcode_core::llm::provider::MessageContent::Text(
+                    self.system_prompt.clone(),
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning: None,
+                reasoning_details: None,
+                origin_tool: None,
+            });
         }
 
         let history = session.data.borrow();
@@ -506,7 +516,9 @@ impl ZedAgent {
 
     fn stop_reason_from_finish(finish: FinishReason) -> acp::StopReason {
         match finish {
-            FinishReason::Stop | FinishReason::ToolCalls => acp::StopReason::EndTurn,
+            FinishReason::Stop | FinishReason::ToolCalls | FinishReason::FunctionCall => {
+                acp::StopReason::EndTurn
+            }
             FinishReason::Length => acp::StopReason::MaxTokens,
             FinishReason::ContentFilter | FinishReason::Error(_) => acp::StopReason::Refusal,
         }
@@ -520,7 +532,7 @@ impl ZedAgent {
         &self,
         provider_supports_tools: bool,
         enabled_tools: &[SupportedTool],
-    ) -> Option<Vec<ToolDefinition>> {
+    ) -> Option<Vec<vtcode_core::llm::provider::Tool>> {
         if !provider_supports_tools {
             return None;
         }
@@ -529,10 +541,28 @@ impl ZedAgent {
         if enabled_tools.is_empty() && !include_local {
             None
         } else {
-            Some(
-                self.acp_tool_registry
-                    .definitions_for(enabled_tools, include_local),
-            )
+            let definitions = self
+                .acp_tool_registry
+                .definitions_for(enabled_tools, include_local);
+
+            let tools: Vec<vtcode_core::llm::provider::Tool> = definitions
+                .into_iter()
+                .filter_map(|def| {
+                    def.function.as_ref().map(|func| vtcode_core::llm::provider::Tool {
+                        function: vtcode_core::llm::provider::Function {
+                            name: func.name.clone(),
+                            description: func.description.clone(),
+                            parameters: func.parameters.clone(),
+                        },
+                    })
+                })
+                .collect();
+
+            if tools.is_empty() {
+                None
+            } else {
+                Some(tools)
+            }
         }
     }
 
@@ -871,7 +901,7 @@ impl ZedAgent {
                     tool_call_id: call.id.clone(),
                     llm_response: json!({
                         TOOL_RESPONSE_KEY_STATUS: TOOL_ERROR_LABEL,
-                        TOOL_RESPONSE_KEY_TOOL: call.function.as_ref().expect("Tool call must have function").name,
+                        TOOL_RESPONSE_KEY_TOOL: call.function.name.clone(),
                         TOOL_RESPONSE_KEY_MESSAGE: "Client connection unavailable",
                     })
                     .to_string(),
@@ -882,10 +912,7 @@ impl ZedAgent {
         let mut results = Vec::new();
 
         for call in calls {
-            let func_ref = call
-                .function
-                .as_ref()
-                .expect("Tool call must have function");
+            let func_ref = &call.function;
             let tool_descriptor = self.acp_tool_registry.lookup(&func_ref.name);
             let args_value_result: Result<Value, _> = serde_json::from_str(&func_ref.arguments);
             let args_value_for_input = args_value_result.as_ref().ok().cloned();
@@ -1837,9 +1864,8 @@ impl acp::Agent for ZedAgent {
                         }
                     }
                     LLMStreamEvent::Completed { response } => {
-                        if assistant_message.is_empty()
-                            && let Some(content) = response.content
-                        {
+                        if assistant_message.is_empty() {
+                            let content = response.content.clone();
                             if !content.is_empty() {
                                 let chunk = text_chunk(content.clone());
                                 self.send_update(
@@ -1911,10 +1937,17 @@ impl acp::Agent for ZedAgent {
                     }
                     self.push_message(
                         &session,
-                        Message::assistant_with_tools(
-                            response.content.clone().unwrap_or_default(),
-                            tool_calls.clone(),
-                        ),
+                        Message {
+                            role: vtcode_core::llm::provider::MessageRole::Assistant,
+                            content: vtcode_core::llm::provider::MessageContent::Text(
+                                response.content.clone(),
+                            ),
+                            tool_calls: Some(tool_calls.clone()),
+                            tool_call_id: None,
+                            reasoning: None,
+                            reasoning_details: None,
+                            origin_tool: None,
+                        },
                     );
                     let tool_results = self
                         .execute_tool_calls(&session, &args.session_id, &tool_calls)
@@ -1936,30 +1969,29 @@ impl acp::Agent for ZedAgent {
                     continue;
                 }
 
-                if let Some(content) = response.content.clone() {
-                    if !content.is_empty() {
-                        if plan.has_context_step()
-                            && !plan.context_completed()
-                            && plan.complete_context()
-                        {
-                            self.send_plan_update(&args.session_id, &plan).await?;
-                        }
-                        if plan.start_response() {
-                            self.send_plan_update(&args.session_id, &plan).await?;
-                        }
-                        if session.cancel_flag.get() {
-                            stop_reason = acp::StopReason::Cancelled;
-                            break;
-                        }
-                        let chunk = text_chunk(content.clone());
-                        self.send_update(
-                            &args.session_id,
-                            acp::SessionUpdate::AgentMessageChunk(chunk),
-                        )
-                        .await?;
+                let content = response.content.clone();
+                if !content.is_empty() {
+                    if plan.has_context_step()
+                        && !plan.context_completed()
+                        && plan.complete_context()
+                    {
+                        self.send_plan_update(&args.session_id, &plan).await?;
                     }
-                    assistant_message = content;
+                    if plan.start_response() {
+                        self.send_plan_update(&args.session_id, &plan).await?;
+                    }
+                    if session.cancel_flag.get() {
+                        stop_reason = acp::StopReason::Cancelled;
+                        break;
+                    }
+                    let chunk = text_chunk(content.clone());
+                    self.send_update(
+                        &args.session_id,
+                        acp::SessionUpdate::AgentMessageChunk(chunk),
+                    )
+                    .await?;
                 }
+                assistant_message = content;
 
                 if let Some(reasoning) =
                     response.reasoning.filter(|reasoning| !reasoning.is_empty())

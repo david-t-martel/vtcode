@@ -4,10 +4,12 @@ use crate::config::core::PromptCachingConfig;
 use crate::llm::client::LLMClient;
 use crate::llm::error_display;
 use crate::llm::provider::{
-    FinishReason, LLMError, LLMProvider, LLMRequest, LLMResponse, Message, MessageContent,
-    MessageRole, ToolCall, ToolChoice, ToolDefinition, Usage,
+    LLMProvider, LLMRequest, LLMStream, LLMStreamEvent, Message, MessageContent, MessageRole,
+    ToolChoice,
 };
 use crate::llm::types as llm_types;
+use crate::llm::types::{FinishReason, LLMError, LLMResponse, ToolCall, ToolDefinition, Usage};
+use async_stream::try_stream;
 use async_trait::async_trait;
 use reqwest::Client as HttpClient;
 use serde_json::{Value, json};
@@ -261,19 +263,16 @@ impl ZAIProvider {
                         let tool_calls_json: Vec<Value> = tool_calls
                             .iter()
                             .filter_map(|tc| {
-                                if let Some(ref func) = tc.function {
-                                    active_tool_call_ids.insert(tc.id.clone());
-                                    Some(json!({
-                                        "id": tc.id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": func.name,
-                                            "arguments": func.arguments,
-                                        }
-                                    }))
-                                } else {
-                                    None
-                                }
+                                let func = &tc.function;
+                                active_tool_call_ids.insert(tc.id.clone());
+                                Some(json!({
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": func.name,
+                                        "arguments": func.arguments,
+                                    }
+                                }))
                             })
                             .collect();
                         message["tool_calls"] = Value::Array(tool_calls_json);
@@ -318,7 +317,8 @@ impl ZAIProvider {
         }
 
         if let Some(tools) = &request.tools {
-            if let Some(serialized) = Self::serialize_tools(tools) {
+            let defs: Vec<ToolDefinition> = tools.iter().map(ToolDefinition::from).collect();
+            if let Some(serialized) = Self::serialize_tools(&defs) {
                 payload["tools"] = serialized;
             }
         }
@@ -364,7 +364,8 @@ impl ZAIProvider {
         let content = message
             .get("content")
             .and_then(|c| c.as_str())
-            .map(|s| s.to_string());
+            .map(|s| s.to_string())
+            .unwrap_or_default();
 
         let reasoning = message
             .get("reasoning_content")
@@ -407,30 +408,31 @@ impl ZAIProvider {
             prompt_tokens: usage_value
                 .get("prompt_tokens")
                 .and_then(|pt| pt.as_u64())
-                .unwrap_or(0) as u32,
+                .unwrap_or(0) as usize,
             completion_tokens: usage_value
                 .get("completion_tokens")
                 .and_then(|ct| ct.as_u64())
-                .unwrap_or(0) as u32,
+                .unwrap_or(0) as usize,
             total_tokens: usage_value
                 .get("total_tokens")
                 .and_then(|tt| tt.as_u64())
-                .unwrap_or(0) as u32,
+                .unwrap_or(0) as usize,
             cached_prompt_tokens: usage_value
                 .get("prompt_tokens_details")
                 .and_then(|details| details.get("cached_tokens"))
                 .and_then(|value| value.as_u64())
-                .map(|value| value as u32),
+                .map(|value| value as usize),
             cache_creation_tokens: None,
             cache_read_tokens: None,
         });
 
         Ok(LLMResponse {
             content,
-            tool_calls,
+            model: self.model.clone(),
             usage,
             finish_reason,
             reasoning,
+            tool_calls,
             reasoning_details: None,
         })
     }
@@ -478,6 +480,18 @@ impl LLMProvider for ZAIProvider {
         false
     }
 
+    fn supports_parallel_tool_config(&self, _model: &str) -> bool {
+        false
+    }
+
+    fn supports_tools(&self, _model: &str) -> bool {
+        true
+    }
+
+    fn supports_structured_output(&self, _model: &str) -> bool {
+        false
+    }
+
     async fn generate(&self, mut request: LLMRequest) -> Result<LLMResponse, LLMError> {
         if request.model.trim().is_empty() {
             request.model = self.model.clone();
@@ -514,7 +528,7 @@ impl LLMProvider for ZAIProvider {
                     PROVIDER_NAME,
                     &format!("Network error: {}", err),
                 );
-                LLMError::Network(formatted)
+                LLMError::NetworkError(formatted)
             })?;
 
         if !response.status().is_success() {
@@ -619,6 +633,14 @@ impl LLMProvider for ZAIProvider {
 
         Ok(())
     }
+
+    async fn stream(&self, request: LLMRequest) -> Result<LLMStream, LLMError> {
+        let response = self.generate(request).await?;
+        let stream = try_stream! {
+            yield LLMStreamEvent::Completed { response };
+        };
+        Ok(Box::pin(stream))
+    }
 }
 
 #[async_trait]
@@ -629,7 +651,7 @@ impl LLMClient for ZAIProvider {
         let response = LLMProvider::generate(self, request).await?;
 
         Ok(llm_types::LLMResponse {
-            content: response.content.unwrap_or_default(),
+            content: response.content,
             model: request_model,
             usage: response.usage.map(|usage| llm_types::Usage {
                 prompt_tokens: usage.prompt_tokens as usize,
@@ -640,7 +662,17 @@ impl LLMClient for ZAIProvider {
                 cache_read_tokens: usage.cache_read_tokens.map(|v| v as usize),
             }),
             reasoning: response.reasoning,
+            tool_calls: response.tool_calls,
+            finish_reason: response.finish_reason,
+            reasoning_details: response.reasoning_details,
         })
+    }
+
+    async fn stream(
+        &self,
+        request: llm_types::LLMRequest,
+    ) -> Result<llm_types::LLMStream, LLMError> {
+        LLMProvider::stream(self, request).await
     }
 
     fn backend_kind(&self) -> llm_types::BackendKind {

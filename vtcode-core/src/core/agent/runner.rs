@@ -13,9 +13,10 @@ pub use crate::core::agent::task::{ContextItem, Task, TaskOutcome, TaskResults};
 use crate::core::agent::types::AgentType;
 use crate::exec::events::{CommandExecutionStatus, ThreadEvent};
 use crate::gemini::{Content, Part, Tool};
+use crate::llm::cache::LLMCacheConfig;
 use crate::llm::factory::create_provider_for_model;
 use crate::llm::provider as uni_provider;
-use crate::llm::provider::{FunctionDefinition, LLMRequest, Message, ToolCall, ToolDefinition};
+use crate::llm::types::{FunctionDefinition, LLMRequest, Message, ToolCall, ToolDefinition};
 use crate::llm::{AnyClient, make_client};
 use crate::mcp::McpClient;
 use crate::prompts::system::compose_system_instruction_text;
@@ -84,7 +85,7 @@ fn record_turn_duration(
 }
 
 struct ProviderResponseSummary {
-    response: crate::llm::provider::LLMResponse,
+    response: crate::llm::types::LLMResponse,
     content: String,
     reasoning: Option<String>,
     agent_message_streamed: bool,
@@ -414,7 +415,7 @@ impl AgentRunner {
         let mut reasoning_recorded = false;
         let mut aggregated_text = String::new();
         let mut aggregated_reasoning = String::new();
-        let mut streaming_response: Option<crate::llm::provider::LLMResponse> = None;
+        let mut streaming_response: Option<crate::llm::types::LLMResponse> = None;
 
         if supports_streaming {
             match self.provider_client.stream(request.clone()).await {
@@ -474,7 +475,7 @@ impl AgentRunner {
         }
 
         if let Some(mut response) = streaming_response {
-            let response_text = response.content.clone().unwrap_or_default();
+            let response_text = response.content.clone();
             if !response_text.is_empty() {
                 aggregated_text = response_text.clone();
             }
@@ -537,7 +538,7 @@ impl AgentRunner {
                 )
             })?;
 
-        let content = response.content.clone().unwrap_or_default();
+        let content = response.content.clone();
         let reasoning = response.reasoning.clone();
 
         Ok(ProviderResponseSummary {
@@ -561,7 +562,8 @@ impl AgentRunner {
         verbosity: Option<VerbosityLevel>,
     ) -> Result<Self> {
         // Create client based on model
-        let client: AnyClient = make_client(api_key.clone(), model.clone());
+        let client: AnyClient =
+            make_client(api_key.clone(), model.clone(), LLMCacheConfig::default());
 
         // Create unified provider client for tool calling
         let provider_client = create_provider_for_model(model.as_str(), api_key.clone(), None)
@@ -708,7 +710,7 @@ impl AgentRunner {
             build_messages_from_conversation(&system_instruction, &conversation);
 
         // Convert Gemini tools to universal ToolDefinition format
-        let tools: Vec<ToolDefinition> = gemini_tools
+        let _tools: Vec<ToolDefinition> = gemini_tools
             .into_iter()
             .flat_map(|tool| tool.function_declarations)
             .map(|decl| ToolDefinition {
@@ -756,14 +758,7 @@ impl AgentRunner {
                 turn + 1
             );
 
-            let parallel_tool_config = if self
-                .provider_client
-                .supports_parallel_tool_config(&self.model)
-            {
-                Some(crate::llm::provider::ParallelToolConfig::anthropic_optimized())
-            } else {
-                None
-            };
+            let parallel_tool_config = None;
 
             let provider_kind = self
                 .model
@@ -791,7 +786,7 @@ impl AgentRunner {
             let request = LLMRequest {
                 messages: request_messages,
                 system_prompt: Some(system_instruction.clone()),
-                tools: Some(tools.clone()),
+                tools: None,
                 model: effective_model,
                 max_tokens: Some(2000),
                 temperature: Some(0.7),
@@ -879,10 +874,9 @@ impl AgentRunner {
                                 text: response_text.clone(),
                             }],
                         });
-                        task_state.conversation_messages.push(
-                            Message::assistant(response_text.clone())
-                                .with_reasoning(reasoning.clone()),
-                        );
+                        let mut assistant_msg = Message::assistant(response_text.clone());
+                        assistant_msg.reasoning = reasoning.clone();
+                        task_state.conversation_messages.push(assistant_msg);
                     }
 
                     let warning_message =
@@ -906,11 +900,7 @@ impl AgentRunner {
                     .as_ref()
                     .map_or(true, |calls| calls.is_empty())
                 {
-                    if let Some(args_value) = resp
-                        .content
-                        .as_ref()
-                        .and_then(|text| detect_textual_run_terminal_cmd(text))
-                    {
+                    if let Some(args_value) = detect_textual_run_terminal_cmd(&resp.content) {
                         let call_id = format!(
                             "textual_call_{}_{}",
                             turn,
@@ -930,21 +920,13 @@ impl AgentRunner {
                         had_tool_call = true;
                         let tool_calls_vec = tool_calls.clone();
 
-                        task_state.conversation_messages.push(
-                            Message::assistant_with_tools(
-                                response_text.clone(),
-                                tool_calls_vec.clone(),
-                            )
-                            .with_reasoning(reasoning.clone()),
-                        );
+                        let mut assistant_msg = Message::assistant(response_text.clone());
+                        assistant_msg.tool_calls = Some(tool_calls_vec.clone());
+                        assistant_msg.reasoning = reasoning.clone();
+                        task_state.conversation_messages.push(assistant_msg);
 
                         for call in tool_calls_vec {
-                            let name = call
-                                .function
-                                .as_ref()
-                                .expect("Tool call must have function")
-                                .name
-                                .clone();
+                            let name = call.function.name.clone();
 
                             runner_println!(
                                 self,
@@ -1063,10 +1045,9 @@ impl AgentRunner {
                                 text: response_text.clone(),
                             }],
                         });
-                        task_state.conversation_messages.push(
-                            Message::assistant(response_text.clone())
-                                .with_reasoning(reasoning.clone()),
-                        );
+                        let mut assistant_msg = Message::assistant(response_text.clone());
+                        assistant_msg.reasoning = reasoning.clone();
+                        task_state.conversation_messages.push(assistant_msg);
                     }
                 }
 
@@ -1189,24 +1170,20 @@ impl AgentRunner {
                 continue;
             } else {
                 // Gemini path (existing flow)
-                let response = self
-                    .client
-                    .generate(&serde_json::to_string(&request)?)
-                    .await
-                    .map_err(|e| {
-                        runner_println!(
-                            self,
-                            "{} {} Failed",
-                            agent_prefix,
-                            style("(ERROR)").red().bold().on_black()
-                        );
-                        anyhow!(
-                            "Agent {} execution failed at turn {}: {}",
-                            self.agent_type,
-                            turn,
-                            e
-                        )
-                    })?;
+                let response = self.client.generate_request(&request).await.map_err(|e| {
+                    runner_println!(
+                        self,
+                        "{} {} Failed",
+                        agent_prefix,
+                        style("(ERROR)").red().bold().on_black()
+                    );
+                    anyhow!(
+                        "Agent {} execution failed at turn {}: {}",
+                        self.agent_type,
+                        turn,
+                        e
+                    )
+                })?;
                 response_opt = Some(response);
             }
 

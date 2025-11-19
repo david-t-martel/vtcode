@@ -14,11 +14,14 @@ use crate::gemini::{
 };
 use crate::llm::client::LLMClient;
 use crate::llm::error_display;
-use crate::llm::provider::{
-    FinishReason, FunctionCall, LLMError, LLMProvider, LLMRequest, LLMResponse, LLMStream,
-    LLMStreamEvent, Message, MessageContent, MessageRole, ToolCall, ToolChoice,
-};
+use crate::llm::provider::LLMProvider;
 use crate::llm::types as llm_types;
+use crate::llm::types::{
+    ContentPart, FinishReason, Function as LlmFunction, FunctionCall as LlmFunctionCall,
+    FunctionDefinition as LlmFunctionDefinition, LLMError, LLMRequest, LLMResponse, LLMStream,
+    LLMStreamEvent, Message, MessageContent, MessageRole, ParallelToolConfig, Tool as LlmTool,
+    ToolCall as LlmToolCall, ToolChoice, ToolDefinition as LlmToolDefinition,
+};
 use async_stream::try_stream;
 use async_trait::async_trait;
 use reqwest::Client as HttpClient;
@@ -122,6 +125,22 @@ impl LLMProvider for GeminiProvider {
         models::google::REASONING_MODELS.contains(&model)
     }
 
+    fn supports_reasoning_effort(&self, model: &str) -> bool {
+        models::google::REASONING_MODELS.contains(&model)
+    }
+
+    fn supports_parallel_tool_config(&self, _model: &str) -> bool {
+        false
+    }
+
+    fn supports_tools(&self, _model: &str) -> bool {
+        true
+    }
+
+    fn supports_structured_output(&self, _model: &str) -> bool {
+        false
+    }
+
     async fn generate(&self, request: LLMRequest) -> Result<LLMResponse, LLMError> {
         let gemini_request = self.convert_to_gemini_request(&request)?;
 
@@ -139,7 +158,7 @@ impl LLMProvider for GeminiProvider {
             .map_err(|e| {
                 let formatted_error =
                     error_display::format_llm_error("Gemini", &format!("Network error: {}", e));
-                LLMError::Network(formatted_error)
+                LLMError::NetworkError(formatted_error)
             })?;
 
         if !response.status().is_success() {
@@ -214,7 +233,7 @@ impl LLMProvider for GeminiProvider {
             .map_err(|e| {
                 let formatted_error =
                     error_display::format_llm_error("Gemini", &format!("Network error: {}", e));
-                LLMError::Network(formatted_error)
+                LLMError::NetworkError(formatted_error)
             })?;
 
         if !response.status().is_success() {
@@ -460,9 +479,8 @@ impl GeminiProvider {
                 && let Some(tool_calls) = &message.tool_calls
             {
                 for tool_call in tool_calls {
-                    if let Some(ref func) = tool_call.function {
-                        call_map.insert(tool_call.id.clone(), func.name.clone());
-                    }
+                    let func = &tool_call.function;
+                    call_map.insert(tool_call.id.clone(), func.name.clone());
                 }
             }
         }
@@ -473,7 +491,7 @@ impl GeminiProvider {
                 continue;
             }
 
-            let content_text = message.content.as_text();
+            let content_text = message.content.as_text().unwrap_or_default().to_string();
             let mut parts: Vec<Part> = Vec::new();
             if message.role != MessageRole::Tool && !message.content.is_empty() {
                 parts.push(Part::Text {
@@ -485,17 +503,16 @@ impl GeminiProvider {
                 && let Some(tool_calls) = &message.tool_calls
             {
                 for tool_call in tool_calls {
-                    if let Some(ref func) = tool_call.function {
-                        let parsed_args =
-                            serde_json::from_str(&func.arguments).unwrap_or_else(|_| json!({}));
-                        parts.push(Part::FunctionCall {
-                            function_call: GeminiFunctionCall {
-                                name: func.name.clone(),
-                                args: parsed_args,
-                                id: Some(tool_call.id.clone()),
-                            },
-                        });
-                    }
+                    let func = &tool_call.function;
+                    let parsed_args =
+                        serde_json::from_str(&func.arguments).unwrap_or_else(|_| json!({}));
+                    parts.push(Part::FunctionCall {
+                        function_call: GeminiFunctionCall {
+                            name: func.name.clone(),
+                            args: parsed_args,
+                            id: Some(tool_call.id.clone()),
+                        },
+                    });
                 }
             }
 
@@ -545,11 +562,9 @@ impl GeminiProvider {
                 .iter()
                 .map(|tool| Tool {
                     function_declarations: vec![FunctionDeclaration {
-                        name: tool.function.as_ref().unwrap().name.clone(),
-                        description: tool.function.as_ref().unwrap().description.clone(),
-                        parameters: sanitize_function_parameters(
-                            tool.function.as_ref().unwrap().parameters.clone(),
-                        ),
+                        name: tool.function.name.clone(),
+                        description: tool.function.description.clone(),
+                        parameters: sanitize_function_parameters(tool.function.parameters.clone()),
                     }],
                 })
                 .collect()
@@ -575,11 +590,9 @@ impl GeminiProvider {
                 Some(ToolChoice::Any) => ToolConfig {
                     function_calling_config: FunctionCallingConfig::any(),
                 },
-                Some(ToolChoice::Specific(spec)) => {
+                Some(ToolChoice::Tool(name)) => {
                     let mut config = FunctionCallingConfig::any();
-                    if spec.tool_type == "function" {
-                        config.allowed_function_names = Some(vec![spec.function.name.clone()]);
-                    }
+                    config.allowed_function_names = Some(vec![name.clone()]);
                     ToolConfig {
                         function_calling_config: config,
                     }
@@ -619,7 +632,8 @@ impl GeminiProvider {
 
         if candidate.content.parts.is_empty() {
             return Ok(LLMResponse {
-                content: Some(String::new()),
+                content: String::new(),
+                model: String::new(), // Placeholder, will be filled by LLMClient
                 tool_calls: None,
                 usage: None,
                 finish_reason: FinishReason::Stop,
@@ -647,14 +661,14 @@ impl GeminiProvider {
                             tool_calls.len()
                         )
                     });
-                    tool_calls.push(ToolCall {
+                    tool_calls.push(LlmToolCall {
                         id: call_id,
                         call_type: "function".to_string(),
-                        function: Some(FunctionCall {
+                        function: LlmFunctionCall {
                             name: function_call.name,
                             arguments: serde_json::to_string(&function_call.args)
                                 .unwrap_or_else(|_| "{}".to_string()),
-                        }),
+                        },
                         text: None,
                     });
                 }
@@ -674,11 +688,8 @@ impl GeminiProvider {
         };
 
         Ok(LLMResponse {
-            content: if text_content.is_empty() {
-                None
-            } else {
-                Some(text_content)
-            },
+            content: text_content,
+            model: String::new(), // Placeholder, will be filled by LLMClient
             tool_calls: if tool_calls.is_empty() {
                 None
             } else {
@@ -719,7 +730,7 @@ impl GeminiProvider {
                     "Gemini",
                     &format!("Network error: {}", message),
                 );
-                LLMError::Network(formatted)
+                LLMError::NetworkError(formatted)
             }
             StreamingError::ApiError {
                 status_code,
@@ -758,7 +769,7 @@ impl GeminiProvider {
                         operation, duration
                     ),
                 );
-                LLMError::Network(formatted)
+                LLMError::NetworkError(formatted)
             }
             StreamingError::ContentError { message } => {
                 let formatted = error_display::format_llm_error(
@@ -869,7 +880,7 @@ impl LLMClient for GeminiProvider {
 
                         messages.push(Message {
                             role,
-                            content: MessageContent::from(content_text),
+                            content: MessageContent::Text(content_text),
                             reasoning: None,
                             reasoning_details: None,
                             tool_calls: None,
@@ -883,9 +894,9 @@ impl LLMClient for GeminiProvider {
                         gemini_tools
                             .iter()
                             .flat_map(|tool| &tool.function_declarations)
-                            .map(|decl| crate::llm::provider::ToolDefinition {
+                            .map(|decl| LlmToolDefinition {
                                 tool_type: "function".to_string(),
-                                function: Some(crate::llm::provider::FunctionDefinition {
+                                function: Some(LlmFunctionDefinition {
                                     name: decl.name.clone(),
                                     description: decl.description.clone(),
                                     parameters: decl.parameters.clone(),
@@ -900,7 +911,7 @@ impl LLMClient for GeminiProvider {
                     let llm_request = LLMRequest {
                         messages,
                         system_prompt,
-                        tools,
+                        tools: None,
                         model: self.model.clone(),
                         max_tokens: gemini_request
                             .generation_config
@@ -932,36 +943,37 @@ impl LLMClient for GeminiProvider {
                             // Create a JSON structure that the agent can parse
                             let tool_call_json = json!({
                                 "tool_calls": tool_calls.iter().filter_map(|tc| {
-                                    tc.function.as_ref().map(|func| {
-                                        json!({
-                                            "function": {
-                                                "name": func.name,
-                                                "arguments": func.arguments
-                                            }
-                                        })
-                                    })
+                                    Some(json!({
+                                        "function": {
+                                            "name": tc.function.name,
+                                            "arguments": tc.function.arguments
+                                        }
+                                    }))
                                 }).collect::<Vec<_>>()
                             });
                             tool_call_json.to_string()
                         } else {
-                            response.content.unwrap_or("".to_string())
+                            response.content
                         }
                     } else {
-                        response.content.unwrap_or("".to_string())
+                        response.content
                     };
 
                     return Ok(llm_types::LLMResponse {
                         content,
                         model: self.model.clone(),
                         usage: response.usage.map(|u| llm_types::Usage {
-                            prompt_tokens: u.prompt_tokens as usize,
-                            completion_tokens: u.completion_tokens as usize,
-                            total_tokens: u.total_tokens as usize,
-                            cached_prompt_tokens: u.cached_prompt_tokens.map(|v| v as usize),
-                            cache_creation_tokens: u.cache_creation_tokens.map(|v| v as usize),
-                            cache_read_tokens: u.cache_read_tokens.map(|v| v as usize),
+                            prompt_tokens: u.prompt_tokens,
+                            completion_tokens: u.completion_tokens,
+                            total_tokens: u.total_tokens,
+                            cached_prompt_tokens: u.cached_prompt_tokens,
+                            cache_creation_tokens: u.cache_creation_tokens,
+                            cache_read_tokens: u.cache_read_tokens,
                         }),
                         reasoning: response.reasoning,
+                        tool_calls: response.tool_calls,
+                        finish_reason: response.finish_reason,
+                        reasoning_details: response.reasoning_details,
                     });
                 }
                 Err(_) => {
@@ -1021,18 +1033,28 @@ impl LLMClient for GeminiProvider {
         let response = LLMProvider::generate(self, request).await?;
 
         Ok(llm_types::LLMResponse {
-            content: response.content.unwrap_or("".to_string()),
+            content: response.content,
             model: self.model.clone(),
             usage: response.usage.map(|u| llm_types::Usage {
-                prompt_tokens: u.prompt_tokens as usize,
-                completion_tokens: u.completion_tokens as usize,
-                total_tokens: u.total_tokens as usize,
-                cached_prompt_tokens: u.cached_prompt_tokens.map(|v| v as usize),
-                cache_creation_tokens: u.cache_creation_tokens.map(|v| v as usize),
-                cache_read_tokens: u.cache_read_tokens.map(|v| v as usize),
+                prompt_tokens: u.prompt_tokens,
+                completion_tokens: u.completion_tokens,
+                total_tokens: u.total_tokens,
+                cached_prompt_tokens: u.cached_prompt_tokens,
+                cache_creation_tokens: u.cache_creation_tokens,
+                cache_read_tokens: u.cache_read_tokens,
             }),
             reasoning: response.reasoning,
+            tool_calls: response.tool_calls,
+            finish_reason: response.finish_reason,
+            reasoning_details: response.reasoning_details,
         })
+    }
+
+    async fn stream(
+        &self,
+        request: llm_types::LLMRequest,
+    ) -> Result<llm_types::LLMStream, LLMError> {
+        LLMProvider::stream(self, request).await
     }
 
     fn backend_kind(&self) -> llm_types::BackendKind {
@@ -1048,7 +1070,7 @@ impl LLMClient for GeminiProvider {
 mod tests {
     use super::*;
     use crate::config::constants::models;
-    use crate::llm::provider::{SpecificFunctionChoice, SpecificToolChoice, ToolDefinition};
+    use llm_types::{FunctionCall, Message, ToolCall, ToolChoice, ToolDefinition};
 
     #[test]
     fn convert_to_gemini_request_maps_history_and_system_prompt() {
@@ -1065,11 +1087,11 @@ mod tests {
 
         let tool_def = ToolDefinition::function(
             "list_files".to_string(),
-            "List files".to_string(),
+            "Retrieve the weather for a city".to_string(),
             json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" }
+                    "city": {"type": "string"}
                 }
             }),
         );
@@ -1081,21 +1103,19 @@ mod tests {
                 tool_response,
             ],
             system_prompt: Some("System prompt".to_string()),
-            tools: Some(vec![tool_def]),
+            tools: Some(vec![LlmTool {
+                function_declarations: vec![tool_def.function.unwrap()],
+            }]),
             model: models::google::GEMINI_2_5_FLASH_PREVIEW.to_string(),
             max_tokens: Some(256),
             temperature: Some(0.4),
             stream: false,
-            tool_choice: Some(ToolChoice::Specific(SpecificToolChoice {
-                tool_type: "function".to_string(),
-                function: SpecificFunctionChoice {
-                    name: "list_files".to_string(),
-                },
-            })),
+            tool_choice: Some(ToolChoice::Tool("list_files".to_string())),
             parallel_tool_calls: None,
             parallel_tool_config: None,
             reasoning_effort: None,
             verbosity: None,
+            output_format: None,
         };
 
         let gemini_request = provider
@@ -1157,7 +1177,7 @@ mod tests {
         let llm_response = GeminiProvider::convert_from_gemini_response(response)
             .expect("conversion should succeed");
 
-        assert_eq!(llm_response.content.as_deref(), Some("Here you go"));
+        assert_eq!(llm_response.content, "Here you go");
         let calls = llm_response
             .tool_calls
             .expect("tool call should be present");

@@ -2,7 +2,7 @@
 
 use crate::core::agent::task::{ContextItem, Task};
 use crate::gemini::{Content, Part};
-use crate::llm::provider::Message;
+use crate::llm::types::{Message, MessageContent, MessageRole};
 
 /// Compose the full system instruction text combining the base prompt with task metadata.
 pub fn compose_system_instruction(
@@ -55,7 +55,15 @@ pub fn build_messages_from_conversation(
     conversation: &[Content],
 ) -> Vec<Message> {
     let mut messages = Vec::new();
-    messages.push(Message::system(system_instruction.to_string()));
+    messages.push(Message {
+        role: MessageRole::System,
+        content: MessageContent::Text(system_instruction.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning: None,
+        reasoning_details: None,
+        origin_tool: None,
+    });
 
     for content in conversation {
         let mut text = String::new();

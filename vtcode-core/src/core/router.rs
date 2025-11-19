@@ -111,23 +111,21 @@ impl Router {
                     temperature: Some(0.0),
                     stream: false,
                     output_format: None,
-                    tool_choice: Some(uni::ToolChoice::none()),
+                    tool_choice: Some(uni::ToolChoice::None),
                     parallel_tool_calls: None,
                     parallel_tool_config: None,
                     reasoning_effort,
                     verbosity: None,
                 };
                 if let Ok(resp) = provider.generate(req).await {
-                    if let Some(text) = resp.content {
-                        let t = text.trim().to_lowercase();
-                        class = match t {
-                            x if x.contains("codegen") => TaskClass::CodegenHeavy,
-                            x if x.contains("retrieval") => TaskClass::RetrievalHeavy,
-                            x if x.contains("complex") => TaskClass::Complex,
-                            x if x.contains("simple") => TaskClass::Simple,
-                            _ => TaskClass::Standard,
-                        };
-                    }
+                    let t = resp.content.trim().to_lowercase();
+                    class = match t.as_str() {
+                        x if x.contains("codegen") => TaskClass::CodegenHeavy,
+                        x if x.contains("retrieval") => TaskClass::RetrievalHeavy,
+                        x if x.contains("complex") => TaskClass::Complex,
+                        x if x.contains("simple") => TaskClass::Simple,
+                        _ => TaskClass::Standard,
+                    };
                 }
             }
         }

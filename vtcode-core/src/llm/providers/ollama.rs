@@ -3,10 +3,12 @@ use crate::config::constants::{env_vars, models, urls};
 use crate::config::core::PromptCachingConfig;
 use crate::llm::client::LLMClient;
 use crate::llm::provider::{
-    FinishReason, LLMError, LLMProvider, LLMRequest, LLMResponse, LLMStream, LLMStreamEvent,
-    Message, MessageRole, ToolCall, ToolChoice, ToolDefinition, Usage,
+    LLMProvider, LLMRequest, LLMStream, LLMStreamEvent, Message, MessageRole, ToolChoice,
 };
 use crate::llm::types as llm_types;
+use crate::llm::types::{
+    FinishReason, Function, LLMError, LLMResponse, Tool, ToolCall, ToolDefinition, Usage,
+};
 use anyhow::Result;
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -249,7 +251,20 @@ impl OllamaProvider {
 
         let tools = value
             .get("tools")
-            .and_then(|entry| serde_json::from_value::<Vec<ToolDefinition>>(entry.clone()).ok());
+            .and_then(|entry| serde_json::from_value::<Vec<ToolDefinition>>(entry.clone()).ok())
+            .map(|defs| {
+                defs.into_iter()
+                    .filter_map(|def| {
+                        def.function.map(|func| Tool {
+                            function: Function {
+                                name: func.name,
+                                description: func.description,
+                                parameters: func.parameters,
+                            },
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
 
         Some(LLMRequest {
             messages,
@@ -303,7 +318,7 @@ impl OllamaProvider {
         }
 
         for message in &request.messages {
-            let content_text = message.content.as_text();
+            let content_text = message.content.as_text().unwrap_or_default().to_string();
             match message.role {
                 MessageRole::Tool => {
                     let tool_name = message
@@ -327,26 +342,25 @@ impl OllamaProvider {
                         tool_name: None,
                     };
 
-                    if let Some(tool_calls) = message.get_tool_calls() {
+                    if let Some(tool_calls) = message.tool_calls.as_ref() {
                         let mut converted = Vec::new();
                         for (index, tool_call) in tool_calls.iter().enumerate() {
-                            if let Some(ref func) = tool_call.function {
-                                if !tool_call.id.is_empty() {
-                                    tool_names
-                                        .entry(tool_call.id.clone())
-                                        .or_insert_with(|| func.name.clone());
-                                }
-
-                                let arguments = Self::parse_tool_arguments(&func.arguments)?;
-                                converted.push(OllamaToolCall {
-                                    call_type: tool_call.call_type.clone(),
-                                    function: OllamaToolFunctionCall {
-                                        name: func.name.clone(),
-                                        arguments: Some(arguments),
-                                        index: Some(index as u32),
-                                    },
-                                });
+                            let func = &tool_call.function;
+                            if !tool_call.id.is_empty() {
+                                tool_names
+                                    .entry(tool_call.id.clone())
+                                    .or_insert_with(|| func.name.clone());
                             }
+
+                            let arguments = Self::parse_tool_arguments(&func.arguments)?;
+                            converted.push(OllamaToolCall {
+                                call_type: "function".to_string(),
+                                function: OllamaToolFunctionCall {
+                                    name: func.name.clone(),
+                                    arguments: Some(arguments),
+                                    index: Some(index as u32),
+                                },
+                            });
                         }
 
                         if !converted.is_empty() {
@@ -371,9 +385,12 @@ impl OllamaProvider {
             None
         };
 
-        let tools = match request.tool_choice {
+        let tools: Option<Vec<ToolDefinition>> = match request.tool_choice {
             Some(ToolChoice::None) => None,
-            _ => request.tools.clone(),
+            _ => request
+                .tools
+                .as_ref()
+                .map(|defs| defs.iter().map(ToolDefinition::from).collect()),
         };
 
         Ok(OllamaChatRequest {
@@ -463,8 +480,8 @@ impl OllamaProvider {
             return None;
         }
 
-        let prompt = prompt_tokens.unwrap_or_default();
-        let completion = completion_tokens.unwrap_or_default();
+        let prompt = prompt_tokens.unwrap_or_default() as usize;
+        let completion = completion_tokens.unwrap_or_default() as usize;
         Some(Usage {
             prompt_tokens: prompt,
             completion_tokens: completion,
@@ -485,6 +502,7 @@ impl OllamaProvider {
     }
 
     fn build_response(
+        model: String,
         content: Option<String>,
         tool_calls: Option<Vec<ToolCall>>,
         reasoning: Option<String>,
@@ -498,7 +516,8 @@ impl OllamaProvider {
         }
 
         LLMResponse {
-            content,
+            content: content.unwrap_or_default(),
+            model,
             tool_calls,
             usage: Self::usage_from_counts(prompt_tokens, completion_tokens),
             finish_reason: finish,
@@ -619,7 +638,7 @@ struct OllamaErrorResponse {
 
 fn map_reqwest_error(err: reqwest::Error) -> LLMError {
     if err.is_timeout() || err.is_connect() {
-        LLMError::Network(err.to_string())
+        LLMError::NetworkError(err.to_string())
     } else {
         LLMError::Provider(err.to_string())
     }
@@ -650,6 +669,14 @@ impl LLMProvider for OllamaProvider {
 
     fn supports_reasoning_effort(&self, model: &str) -> bool {
         models::ollama::REASONING_LEVEL_MODELS.contains(&model)
+    }
+
+    fn supports_parallel_tool_config(&self, _model: &str) -> bool {
+        false
+    }
+
+    fn supports_structured_output(&self, _model: &str) -> bool {
+        false
     }
 
     async fn generate(&self, mut request: LLMRequest) -> Result<LLMResponse, LLMError> {
@@ -698,6 +725,7 @@ impl LLMProvider for OllamaProvider {
         };
 
         Ok(Self::build_response(
+            request.model.clone(),
             content,
             tool_calls,
             reasoning,
@@ -805,6 +833,7 @@ impl LLMProvider for OllamaProvider {
             }
 
             let response = Self::build_response(
+                request.model.clone(),
                 if accumulated.is_empty() {
                     None
                 } else {
@@ -876,7 +905,7 @@ impl LLMClient for OllamaProvider {
         let response = LLMProvider::generate(self, request).await?;
 
         Ok(llm_types::LLMResponse {
-            content: response.content.unwrap_or_default(),
+            content: response.content,
             model: request_model,
             usage: response.usage.map(|usage| llm_types::Usage {
                 prompt_tokens: usage.prompt_tokens as usize,
@@ -887,7 +916,17 @@ impl LLMClient for OllamaProvider {
                 cache_read_tokens: usage.cache_read_tokens.map(|value| value as usize),
             }),
             reasoning: response.reasoning,
+            tool_calls: response.tool_calls,
+            finish_reason: response.finish_reason,
+            reasoning_details: response.reasoning_details,
         })
+    }
+
+    async fn stream(
+        &self,
+        request: llm_types::LLMRequest,
+    ) -> Result<llm_types::LLMStream, LLMError> {
+        LLMProvider::stream(self, request).await
     }
 
     fn backend_kind(&self) -> llm_types::BackendKind {

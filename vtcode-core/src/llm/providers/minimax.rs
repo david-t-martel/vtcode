@@ -3,9 +3,10 @@ use crate::config::TimeoutsConfig;
 use crate::config::constants::models;
 use crate::config::core::PromptCachingConfig;
 use crate::llm::client::LLMClient;
-use crate::llm::provider::{
-    FinishReason, LLMError, LLMProvider, LLMRequest, LLMResponse, LLMStream, LLMStreamEvent,
-    ToolCall, ToolDefinition,
+use crate::llm::provider::LLMProvider;
+use crate::llm::types::{
+    FinishReason, Function, FunctionCall, LLMError, LLMRequest, LLMResponse, LLMStream,
+    LLMStreamEvent, Message, Tool, ToolCall,
 };
 use async_stream::try_stream;
 use async_trait::async_trait;
@@ -15,9 +16,10 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 const TOOL_CALL_BLOCK_PATTERN: &str = r"(?s)<minimax:tool_call>(.*?)</minimax:tool_call>";
-const INVOKE_BLOCK_PATTERN: &str = r#"(?s)<invoke\s+name=("[^"]*"|'[^']*'|[^\s>]+)>(.*?)</invoke>"#;
+const INVOKE_BLOCK_PATTERN: &str =
+    r#"(?s)<invoke\s+name=(\"[^\"]*\"|'[^']*'|[^\s>]+)>(.*?)</invoke>"#;
 const PARAMETER_BLOCK_PATTERN: &str =
-    r#"(?s)<parameter\s+name=("[^"]*"|'[^']*'|[^\s>]+)>(.*?)</parameter>"#;
+    r#"(?s)<parameter\s+name=(\"[^\"]*\"|'[^']*'|[^\s>]+)>(.*?)</parameter>"#;
 
 pub struct MinimaxProvider {
     inner: AnthropicProvider,
@@ -71,18 +73,19 @@ impl LLMProvider for MinimaxProvider {
         self.inner.supports_parallel_tool_config(model)
     }
 
+    fn supports_structured_output(&self, model: &str) -> bool {
+        self.inner.supports_structured_output(model)
+    }
+
     async fn generate(&self, request: LLMRequest) -> Result<LLMResponse, LLMError> {
         let tools = request.tools.clone();
-        let response = self.inner.generate(request).await?;
-        Ok(post_process_response(
-            response,
-            tools.as_ref().map(|defs| defs.as_slice()),
-        ))
+        let response = LLMProvider::generate(&self.inner, request).await?;
+        Ok(post_process_response(response, tools.as_deref()))
     }
 
     async fn stream(&self, request: LLMRequest) -> Result<LLMStream, LLMError> {
         let tool_defs = request.tools.clone();
-        let mut inner_stream = self.inner.stream(request).await?;
+        let mut inner_stream = LLMProvider::stream(&self.inner, request).await?;
 
         let stream = try_stream! {
             while let Some(event) = inner_stream.next().await {
@@ -122,6 +125,13 @@ impl LLMClient for MinimaxProvider {
         LLMClient::generate(&mut self.inner, prompt).await
     }
 
+    async fn stream(
+        &self,
+        request: crate::llm::types::LLMRequest,
+    ) -> Result<crate::llm::types::LLMStream, LLMError> {
+        <AnthropicProvider as LLMClient>::stream(&self.inner, request).await
+    }
+
     fn backend_kind(&self) -> crate::llm::types::BackendKind {
         LLMClient::backend_kind(&self.inner)
     }
@@ -131,10 +141,7 @@ impl LLMClient for MinimaxProvider {
     }
 }
 
-fn post_process_response(
-    mut response: LLMResponse,
-    tools: Option<&[ToolDefinition]>,
-) -> LLMResponse {
+fn post_process_response(mut response: LLMResponse, tools: Option<&[Tool]>) -> LLMResponse {
     if response
         .tool_calls
         .as_ref()
@@ -143,18 +150,14 @@ fn post_process_response(
         return response;
     }
 
-    if let Some(content) = response.content.clone() {
-        let (tool_calls, cleaned_content) = parse_minimax_tool_calls(&content, tools);
+    if !response.content.is_empty() {
+        let (tool_calls, cleaned_content) = parse_minimax_tool_calls(&response.content, tools);
 
         if !tool_calls.is_empty() {
             response.tool_calls = Some(tool_calls);
 
             let trimmed = cleaned_content.trim();
-            response.content = if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            };
+            response.content = trimmed.to_string();
 
             if !matches!(response.finish_reason, FinishReason::ToolCalls) {
                 response.finish_reason = FinishReason::ToolCalls;
@@ -165,10 +168,7 @@ fn post_process_response(
     response
 }
 
-fn parse_minimax_tool_calls(
-    text: &str,
-    tools: Option<&[ToolDefinition]>,
-) -> (Vec<ToolCall>, String) {
+fn parse_minimax_tool_calls(text: &str, tools: Option<&[Tool]>) -> (Vec<ToolCall>, String) {
     let tool_call_regex = Regex::new(TOOL_CALL_BLOCK_PATTERN).ok();
     let invoke_regex = Regex::new(INVOKE_BLOCK_PATTERN).ok();
     let parameter_regex = Regex::new(PARAMETER_BLOCK_PATTERN).ok();
@@ -237,9 +237,7 @@ fn parse_minimax_tool_calls(
     (tool_calls, cleaned)
 }
 
-fn build_parameter_type_map(
-    tools: Option<&[ToolDefinition]>,
-) -> HashMap<String, HashMap<String, String>> {
+fn build_parameter_type_map(tools: Option<&[Tool]>) -> HashMap<String, HashMap<String, String>> {
     let mut map = HashMap::new();
 
     if let Some(defs) = tools {
@@ -247,8 +245,6 @@ fn build_parameter_type_map(
             let mut param_map = HashMap::new();
             if let Some(properties) = tool
                 .function
-                .as_ref()
-                .unwrap()
                 .parameters
                 .get("properties")
                 .and_then(|props| props.as_object())
@@ -272,7 +268,7 @@ fn build_parameter_type_map(
                 }
             }
 
-            map.insert(tool.function.as_ref().unwrap().name.clone(), param_map);
+            map.insert(tool.function.name.clone(), param_map);
         }
     }
 
@@ -281,9 +277,9 @@ fn build_parameter_type_map(
 
 fn extract_name(raw: &str) -> String {
     let trimmed = raw.trim();
-    if trimmed.starts_with('\"') && trimmed.ends_with('\"') && trimmed.len() >= 2 {
+    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
         trimmed[1..trimmed.len() - 1].to_string()
-    } else if trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2 {
+    } else if trimmed.starts_with("' ") && trimmed.ends_with("' ") && trimmed.len() >= 2 {
         trimmed[1..trimmed.len() - 1].to_string()
     } else {
         trimmed.to_string()
@@ -322,43 +318,35 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn sample_tool_definition() -> ToolDefinition {
-        ToolDefinition::function(
-            "search_web".to_string(),
-            "Search function.".to_string(),
-            json!({
-                "type": "object",
-                "properties": {
-                    "query_list": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "query_tag": {
-                        "type": "array",
-                        "items": { "type": "string" }
-                    },
-                    "radius": { "type": "number" },
-                    "verbose": { "type": "boolean" }
-                }
-            }),
-        )
+    fn sample_tool() -> Tool {
+        Tool {
+            function: Function {
+                name: "search_web".to_string(),
+                description: "Search function.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query_list": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "query_tag": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "radius": { "type": "number" },
+                        "verbose": { "type": "boolean" }
+                    }
+                }),
+            },
+        }
     }
 
     #[test]
     fn parses_minimax_tool_calls_and_arguments() {
-        let text = r#"Assistant thinking...
-<minimax:tool_call>
-<invoke name="search_web">
-<parameter name="query_list">["rust", "news"]</parameter>
-<parameter name='query_tag'>["technology"]</parameter>
-<parameter name="radius">12.5</parameter>
-<parameter name="verbose">true</parameter>
-</invoke>
-</minimax:tool_call>
-Continuing response."#;
+        let text = r###"Assistant thinking...\n<minimax:tool_call>\n<invoke name=\"search_web\">\n<parameter name=\"query_list\">[\"rust\", \"news\"]</parameter>\n<parameter name='query_tag'>[\"technology\"]</parameter>\n<parameter name=\"radius\">12.5</parameter>\n<parameter name=\"verbose\">true</parameter>\n</invoke>\n</minimax:tool_call>\nContinuing response."###;
 
-        let (tool_calls, cleaned) =
-            parse_minimax_tool_calls(text, Some(&[sample_tool_definition()]));
+        let (tool_calls, cleaned) = parse_minimax_tool_calls(text, Some(&[sample_tool()]));
 
         assert_eq!(tool_calls.len(), 1);
         let call = &tool_calls[0];
@@ -377,17 +365,11 @@ Continuing response."#;
 
     #[test]
     fn post_processing_infers_tool_calls() {
-        let text = r#"Some text before
-<minimax:tool_call>
-<invoke name="search_web">
-<parameter name="query_list">["minimax"]</parameter>
-<parameter name="query_tag">["ai"]</parameter>
-</invoke>
-</minimax:tool_call>
-"#;
+        let text = r###"Some text before\n<minimax:tool_call>\n<invoke name=\"search_web\">\n<parameter name=\"query_list\">[\"minimax\"]</parameter>\n<parameter name=\"query_tag\">[\"ai\"]</parameter>\n</invoke>\n</minimax:tool_call>\n"###;
 
         let response = LLMResponse {
-            content: Some(text.to_string()),
+            content: text.to_string(),
+            model: String::new(),
             tool_calls: None,
             usage: None,
             finish_reason: FinishReason::Stop,
@@ -401,12 +383,7 @@ Continuing response."#;
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].function.name, "search_web");
         assert!(matches!(processed.finish_reason, FinishReason::ToolCalls));
-        assert!(
-            processed
-                .content
-                .unwrap_or_default()
-                .contains("Some text before")
-        );
+        assert!(processed.content.contains("Some text before"));
     }
 
     #[test]

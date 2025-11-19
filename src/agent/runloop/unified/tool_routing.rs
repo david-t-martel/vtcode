@@ -151,6 +151,7 @@ pub(crate) async fn prompt_tool_permission<S: UiSession + ?Sized>(
     let default_selection = InlineListSelection::ToolApproval(true);
 
     // Show modal list with full context - arrow keys will work here and history navigation is disabled
+    handle.set_agent_state(vtcode_core::ui::state::AgentState::Waiting);
     handle.show_list_modal(
         "Tool Permission Required".to_string(),
         description_lines,

@@ -23,6 +23,7 @@
 -   **vtcode-core/**: Library code (LLM providers, tools, config, MCP integration)
 -   **src/**: CLI binary (Ratatui TUI, PTY execution, slash commands)
 -   **Config**: `vtcode.toml` (never hardcode), constants in `vtcode-core/src/config/constants.rs`, model IDs in `docs/models.json`
+-   **Autofix helper**: `scripts/ollama-autofix.sh` (local Ollama + rg/git/diagnostics; see docs/autocode-fixer.md). Pass `--error-log`, `--ast-rules`, `--apply`; uses `.cache/autofix` for context/history. Reads `AGENTS.md` to follow house rules.
 -   **Key modules**: `llm/` (provider abstraction), `tools/` (trait-based), `config/` (TOML parsing)
 -   **Integration**: Tree-sitter parsers (Rust/Python/JS/TS/Go/Java), MCP tools, PTY command execution
 

@@ -495,13 +495,14 @@ fn test_anthropic_tool_message_handling() {
 
 #[test]
 fn test_backward_compatibility() {
+    use vtcode_core::llm::cache::LLMCacheConfig;
     use vtcode_core::llm::make_client;
     use vtcode_core::models::ModelId;
 
     // Test that the old make_client function still works
     use std::str::FromStr;
     let model = ModelId::from_str("gemini-2.5-flash-preview-05-20").unwrap();
-    let client = make_client("test_key".to_string(), model);
+    let client = make_client("test_key".to_string(), model, LLMCacheConfig::default());
 
     // Should be able to get model ID
     let model_id = client.model_id();

@@ -3,9 +3,10 @@ use crate::config::constants::{env_vars, models, urls};
 use crate::config::core::PromptCachingConfig;
 use crate::llm::client::LLMClient;
 use crate::llm::error_display;
-use crate::llm::provider::{LLMError, LLMProvider, LLMRequest, LLMResponse};
+use crate::llm::provider::{LLMProvider, LLMRequest, LLMStream};
 use crate::llm::providers::openai::OpenAIProvider;
 use crate::llm::types as llm_types;
+use crate::llm::types::{LLMError, LLMResponse};
 use async_trait::async_trait;
 
 use super::common::{forward_prompt_cache_with_state, override_base_url, resolve_model};
@@ -87,6 +88,22 @@ impl LLMProvider for XAIProvider {
         false
     }
 
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn supports_parallel_tool_config(&self, _model: &str) -> bool {
+        false
+    }
+
+    fn supports_tools(&self, _model: &str) -> bool {
+        true
+    }
+
+    fn supports_structured_output(&self, _model: &str) -> bool {
+        false
+    }
+
     async fn generate(&self, mut request: LLMRequest) -> Result<LLMResponse, LLMError> {
         if !self.prompt_cache_enabled {
             // xAI prompt caching is managed by the platform; no additional parameters required.
@@ -128,12 +145,23 @@ impl LLMProvider for XAIProvider {
 
         Ok(())
     }
+
+    async fn stream(&self, request: LLMRequest) -> Result<LLMStream, LLMError> {
+        LLMProvider::stream(&self.inner, request).await
+    }
 }
 
 #[async_trait]
 impl LLMClient for XAIProvider {
     async fn generate(&mut self, prompt: &str) -> Result<llm_types::LLMResponse, LLMError> {
         <OpenAIProvider as LLMClient>::generate(&mut self.inner, prompt).await
+    }
+
+    async fn stream(
+        &self,
+        request: llm_types::LLMRequest,
+    ) -> Result<llm_types::LLMStream, LLMError> {
+        <OpenAIProvider as LLMClient>::stream(&self.inner, request).await
     }
 
     fn backend_kind(&self) -> llm_types::BackendKind {

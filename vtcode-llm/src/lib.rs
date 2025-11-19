@@ -18,6 +18,7 @@ pub use vtcode_commons::{
     ErrorFormatter, ErrorReporter, PathResolver, PathScope, TelemetrySink, WorkspacePaths,
 };
 
+pub use vtcode_core::llm::cache::LLMCacheConfig;
 pub use vtcode_core::llm::client::{AnyClient, make_client};
 pub use vtcode_core::llm::error_display;
 pub use vtcode_core::llm::factory::{
@@ -35,8 +36,7 @@ pub mod provider {
 
     #[cfg(feature = "functions")]
     pub use vtcode_core::llm::provider::{
-        FunctionCall, FunctionDefinition, SpecificFunctionChoice, SpecificToolChoice, ToolCall,
-        ToolChoice, ToolDefinition,
+        FunctionCall, FunctionDefinition, ToolCall, ToolChoice, ToolDefinition,
     };
 }
 
@@ -47,8 +47,7 @@ pub use provider::{
 
 #[cfg(feature = "functions")]
 pub use provider::{
-    FunctionCall, FunctionDefinition, SpecificFunctionChoice, SpecificToolChoice, ToolCall,
-    ToolChoice, ToolDefinition,
+    FunctionCall, FunctionDefinition, ToolCall, ToolChoice, ToolDefinition,
 };
 
 #[cfg(feature = "anthropic")]

@@ -3,11 +3,15 @@ use crate::config::constants::{env_vars, models, urls};
 use crate::config::core::{DeepSeekPromptCacheSettings, PromptCachingConfig};
 use crate::llm::client::LLMClient;
 use crate::llm::error_display;
-use crate::llm::provider::{
-    FinishReason, LLMError, LLMProvider, LLMRequest, LLMResponse, Message, MessageContent,
-    MessageRole, ToolCall, ToolDefinition, Usage,
-};
+use crate::llm::provider::LLMProvider;
 use crate::llm::types as llm_types;
+use crate::llm::types::{
+    ContentPart, FinishReason, Function, FunctionCall, FunctionDefinition, LLMError, LLMRequest,
+    LLMResponse, LLMStream, LLMStreamEvent, Message, MessageContent, MessageRole,
+    ParallelToolConfig, Tool, ToolCall, ToolChoice, ToolDefinition, Usage,
+};
+use anyhow::Result;
+use async_stream::try_stream;
 use async_trait::async_trait;
 use reqwest::Client as HttpClient;
 use serde_json::{Map, Value, json};
@@ -118,6 +122,7 @@ impl DeepSeekProvider {
         let mut system_prompt = value
             .get("system")
             .and_then(|entry| entry.as_str())
+            .filter(|text| !text.trim().is_empty())
             .map(|text| text.to_string());
         let mut messages = Vec::new();
 
@@ -152,7 +157,7 @@ impl DeepSeekProvider {
 
                     messages.push(Message {
                         role: MessageRole::Assistant,
-                        content: MessageContent::from(content),
+                        content: MessageContent::Text(content),
                         reasoning: None,
                         reasoning_details: None,
                         tool_calls,
@@ -181,15 +186,15 @@ impl DeepSeekProvider {
                 .to_string(),
             max_tokens: value
                 .get("max_tokens")
-                .and_then(|m| m.as_u64())
-                .map(|m| m as u32),
+                .and_then(|entry| entry.as_u64())
+                .map(|value| value as u32),
             temperature: value
                 .get("temperature")
-                .and_then(|t| t.as_f64())
-                .map(|t| t as f32),
+                .and_then(|entry| entry.as_f64())
+                .map(|value| value as f32),
             stream: value
                 .get("stream")
-                .and_then(|s| s.as_bool())
+                .and_then(|entry| entry.as_bool())
                 .unwrap_or(false),
             tools: None,
             output_format: None,
@@ -291,22 +296,20 @@ impl DeepSeekProvider {
             );
             message_map.insert(
                 "content".to_string(),
-                Value::String(message.content.as_text()),
+                Value::String(message.content.as_text().unwrap_or_default().to_string()),
             );
 
             if let Some(tool_calls) = &message.tool_calls {
                 let serialized_calls = tool_calls
                     .iter()
-                    .filter_map(|call| {
-                        call.function.as_ref().map(|func| {
-                            json!({
-                                "id": call.id.clone(),
-                                "type": "function",
-                                "function": {
-                                    "name": func.name.clone(),
-                                    "arguments": func.arguments.clone()
-                                }
-                            })
+                    .map(|call| {
+                        json!({
+                            "id": call.id.clone(),
+                            "type": "function",
+                            "function": {
+                                "name": call.function.name.clone(),
+                                "arguments": call.function.arguments.clone()
+                            }
                         })
                     })
                     .collect::<Vec<_>>();
@@ -326,7 +329,7 @@ impl DeepSeekProvider {
         Ok(messages)
     }
 
-    fn serialize_tools(tools: &[ToolDefinition]) -> Option<Vec<Value>> {
+    fn serialize_tools(tools: &[Tool]) -> Option<Vec<Value>> {
         if tools.is_empty() {
             return None;
         }
@@ -421,22 +424,22 @@ impl DeepSeekProvider {
             prompt_tokens: usage_value
                 .get("prompt_tokens")
                 .and_then(|value| value.as_u64())
-                .unwrap_or(0) as u32,
+                .unwrap_or(0) as usize,
             completion_tokens: usage_value
                 .get("completion_tokens")
                 .and_then(|value| value.as_u64())
-                .unwrap_or(0) as u32,
+                .unwrap_or(0) as usize,
             total_tokens: usage_value
                 .get("total_tokens")
                 .and_then(|value| value.as_u64())
-                .unwrap_or(0) as u32,
+                .unwrap_or(0) as usize,
             cached_prompt_tokens: if self.prompt_cache_enabled
                 && self.prompt_cache_settings.surface_metrics
             {
                 usage_value
                     .get("prompt_cache_hit_tokens")
                     .and_then(|value| value.as_u64())
-                    .map(|value| value as u32)
+                    .map(|value| value as usize)
             } else {
                 None
             },
@@ -446,7 +449,7 @@ impl DeepSeekProvider {
                 usage_value
                     .get("prompt_cache_miss_tokens")
                     .and_then(|value| value.as_u64())
-                    .map(|value| value as u32)
+                    .map(|value| value as usize)
             } else {
                 None
             },
@@ -454,7 +457,8 @@ impl DeepSeekProvider {
         });
 
         Ok(LLMResponse {
-            content,
+            content: content.unwrap_or_default(),
+            model: self.model.clone(),
             tool_calls,
             usage,
             finish_reason,
@@ -483,6 +487,22 @@ impl LLMProvider for DeepSeekProvider {
         false
     }
 
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn supports_parallel_tool_config(&self, _model: &str) -> bool {
+        false
+    }
+
+    fn supports_tools(&self, _model: &str) -> bool {
+        true
+    }
+
+    fn supports_structured_output(&self, _model: &str) -> bool {
+        false
+    }
+
     async fn generate(&self, request: LLMRequest) -> Result<LLMResponse, LLMError> {
         let mut request = request;
         if request.model.trim().is_empty() {
@@ -504,7 +524,7 @@ impl LLMProvider for DeepSeekProvider {
                     PROVIDER_NAME,
                     &format!("Network error: {}", e),
                 );
-                LLMError::Network(formatted_error)
+                LLMError::NetworkError(formatted_error)
             })?;
 
         if !response.status().is_success() {
@@ -541,6 +561,15 @@ impl LLMProvider for DeepSeekProvider {
         self.parse_response(response_json)
     }
 
+    async fn stream(&self, request: LLMRequest) -> Result<LLMStream, LLMError> {
+        // Simplified streaming: emit a single completion event using generate.
+        let response = self.generate(request).await?;
+        let stream = try_stream! {
+            yield LLMStreamEvent::Completed { response };
+        };
+        Ok(Box::pin(stream))
+    }
+
     fn supported_models(&self) -> Vec<String> {
         models::deepseek::SUPPORTED_MODELS
             .iter()
@@ -566,18 +595,28 @@ impl LLMClient for DeepSeekProvider {
         let response = LLMProvider::generate(self, request).await?;
 
         Ok(llm_types::LLMResponse {
-            content: response.content.unwrap_or_default(),
+            content: response.content,
             model,
             usage: response.usage.map(|usage| llm_types::Usage {
-                prompt_tokens: usage.prompt_tokens as usize,
-                completion_tokens: usage.completion_tokens as usize,
-                total_tokens: usage.total_tokens as usize,
-                cached_prompt_tokens: usage.cached_prompt_tokens.map(|value| value as usize),
-                cache_creation_tokens: usage.cache_creation_tokens.map(|value| value as usize),
-                cache_read_tokens: usage.cache_read_tokens.map(|value| value as usize),
+                prompt_tokens: usage.prompt_tokens,
+                completion_tokens: usage.completion_tokens,
+                total_tokens: usage.total_tokens,
+                cached_prompt_tokens: usage.cached_prompt_tokens,
+                cache_creation_tokens: usage.cache_creation_tokens,
+                cache_read_tokens: usage.cache_read_tokens,
             }),
             reasoning: response.reasoning,
+            tool_calls: response.tool_calls,
+            finish_reason: response.finish_reason,
+            reasoning_details: response.reasoning_details,
         })
+    }
+
+    async fn stream(
+        &self,
+        request: llm_types::LLMRequest,
+    ) -> Result<llm_types::LLMStream, LLMError> {
+        LLMProvider::stream(self, request).await
     }
 
     fn backend_kind(&self) -> llm_types::BackendKind {

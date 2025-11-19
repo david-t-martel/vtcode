@@ -1,0 +1,17 @@
+repos:
+  - repo: local
+    hooks:
+      - id: vtcode-check
+        name: vtcode code-quality check (fmt, clippy, build, tests, docs)
+        entry: just
+        args: ["check-all"]
+        language: system
+        pass_filenames: false
+
+      - id: vtcode-ollama-autofix
+        name: vtcode Ollama autofix (manual)
+        entry: bash
+        args: ["scripts/ollama-autofix.sh"]
+        language: system
+        pass_filenames: false
+        stages: [manual]

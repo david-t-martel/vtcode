@@ -159,7 +159,10 @@ impl SessionListing {
                 return None;
             }
 
-            let text_projection = message.content.as_text();
+            let Some(text_projection) = message.content.as_text() else {
+                return None;
+            };
+
             if text_projection.trim().is_empty() {
                 return None;
             }

@@ -5,6 +5,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::config::{constants::ui, types::ReasoningEffortLevel};
 use crate::tools::TaskPlan;
+use crate::ui::state::AgentState;
 
 #[derive(Clone, Debug)]
 pub struct InlineHeaderContext {
@@ -269,6 +270,7 @@ pub enum InlineCommand {
     SetPlan {
         plan: TaskPlan,
     },
+    SetAgentState(AgentState),
     SetCursorVisible(bool),
     SetInputEnabled(bool),
     SetInput(String),
@@ -390,6 +392,10 @@ impl InlineHandle {
 
     pub fn set_plan(&self, plan: TaskPlan) {
         let _ = self.sender.send(InlineCommand::SetPlan { plan });
+    }
+
+    pub fn set_agent_state(&self, state: AgentState) {
+        let _ = self.sender.send(InlineCommand::SetAgentState(state));
     }
 
     pub fn set_cursor_visible(&self, visible: bool) {

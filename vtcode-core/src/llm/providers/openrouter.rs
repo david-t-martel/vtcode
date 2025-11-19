@@ -6,11 +6,12 @@ use crate::config::types::ReasoningEffortLevel;
 use crate::llm::client::LLMClient;
 use crate::llm::error_display;
 use crate::llm::provider::{
-    FinishReason, LLMError, LLMProvider, LLMRequest, LLMResponse, LLMStream, LLMStreamEvent,
-    Message, MessageContent, MessageRole, ToolCall, ToolChoice, ToolDefinition, Usage,
+    LLMProvider, LLMRequest, LLMStream, LLMStreamEvent, Message, MessageContent, MessageRole,
+    ToolChoice,
 };
 use crate::llm::rig_adapter::reasoning_parameters_for;
 use crate::llm::types as llm_types;
+use crate::llm::types::{FinishReason, LLMError, LLMResponse, ToolCall, ToolDefinition, Tool, Function, Usage};
 use async_stream::try_stream;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -374,27 +375,27 @@ fn parse_usage_value(value: &Value) -> Usage {
         .get("prompt_cache_read_tokens")
         .or_else(|| value.get("cache_read_input_tokens"))
         .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
+        .map(|v| v as usize);
 
     let cache_creation_tokens = value
         .get("prompt_cache_write_tokens")
         .or_else(|| value.get("cache_creation_input_tokens"))
         .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
+        .map(|v| v as usize);
 
     Usage {
         prompt_tokens: value
             .get("prompt_tokens")
             .and_then(|pt| pt.as_u64())
-            .unwrap_or(0) as u32,
+            .unwrap_or(0) as usize,
         completion_tokens: value
             .get("completion_tokens")
             .and_then(|ct| ct.as_u64())
-            .unwrap_or(0) as u32,
+            .unwrap_or(0) as usize,
         total_tokens: value
             .get("total_tokens")
             .and_then(|tt| tt.as_u64())
-            .unwrap_or(0) as u32,
+            .unwrap_or(0) as usize,
         cached_prompt_tokens: cache_read_tokens,
         cache_creation_tokens,
         cache_read_tokens,
@@ -622,21 +623,17 @@ fn finalize_stream_response(
     usage: Option<Usage>,
     finish_reason: FinishReason,
     reasoning: ReasoningBuffer,
+    model: String,
 ) -> LLMResponse {
-    let content = if aggregated_content.is_empty() {
-        None
-    } else {
-        Some(aggregated_content)
-    };
-
-    let reasoning = reasoning.finalize();
+    let reasoning_text = reasoning.finalize();
 
     LLMResponse {
-        content,
-        tool_calls: finalize_tool_calls(tool_call_builders),
+        content: aggregated_content,
+        model,
         usage,
+        reasoning: reasoning_text,
+        tool_calls: finalize_tool_calls(tool_call_builders),
         finish_reason,
-        reasoning,
         reasoning_details: None,
     }
 }
@@ -794,21 +791,25 @@ impl OpenRouterProvider {
                     cleaned.tool_calls = None;
                     cleaned.tool_call_id = None;
 
-                    let content_text = cleaned.content.as_text();
-                    let has_content = !content_text.trim().is_empty();
-                    if has_content || cleaned.reasoning.is_some() {
+                    if let Some(content_text) = cleaned.content.as_text() {
+                        let has_content = !content_text.trim().is_empty();
+                        if has_content || cleaned.reasoning.is_some() {
+                            normalized_messages.push(cleaned);
+                        }
+                    } else if cleaned.reasoning.is_some() {
                         normalized_messages.push(cleaned);
                     }
                 }
                 MessageRole::Tool => {
-                    let content_text = message.content.as_text();
-                    if content_text.trim().is_empty() {
-                        continue;
-                    }
+                    if let Some(content_text) = message.content.as_text() {
+                        if content_text.trim().is_empty() {
+                            continue;
+                        }
 
-                    let mut converted = Message::user(content_text);
-                    converted.reasoning = message.reasoning.clone();
-                    normalized_messages.push(converted);
+                        let mut converted = Message::user(content_text.to_string());
+                        converted.reasoning = message.reasoning.clone();
+                        normalized_messages.push(converted);
+                    }
                 }
                 _ => {
                     normalized_messages.push(message.clone());
@@ -844,7 +845,7 @@ impl OpenRouterProvider {
             .map_err(|e| {
                 let formatted_error =
                     error_display::format_llm_error("OpenRouter", &format!("Network error: {}", e));
-                LLMError::Network(formatted_error)
+                LLMError::NetworkError(formatted_error)
             })
     }
 
@@ -1029,11 +1030,14 @@ impl OpenRouterProvider {
                         .get("parameters")
                         .cloned()
                         .unwrap_or_else(|| json!({}));
-                    Some(ToolDefinition::function(
-                        name.to_string(),
-                        description,
-                        parameters,
-                    ))
+
+                    Some(Tool {
+                        function: Function {
+                            name: name.to_string(),
+                            description,
+                            parameters,
+                        },
+                    })
                 })
                 .collect();
 
@@ -1157,15 +1161,16 @@ impl OpenRouterProvider {
         for msg in &request.messages {
             match msg.role {
                 MessageRole::System => {
-                    let content_text = msg.content.as_text();
-                    if !content_text.trim().is_empty() {
-                        input.push(json!({
-                            "role": "developer",
-                            "content": [{
-                                "type": "input_text",
-                                "text": content_text
-                            }]
-                        }));
+                    if let Some(content_text) = msg.content.as_text() {
+                        if !content_text.trim().is_empty() {
+                            input.push(json!({
+                                "role": "developer",
+                                "content": [{
+                                    "type": "input_text",
+                                    "text": content_text
+                                }]
+                            }));
+                        }
                     }
                 }
                 MessageRole::User => {
@@ -1188,14 +1193,13 @@ impl OpenRouterProvider {
 
                     if let Some(tool_calls) = &msg.tool_calls {
                         for call in tool_calls {
-                            if let Some(ref func) = call.function {
-                                content_parts.push(json!({
-                                    "type": "tool_call",
-                                    "id": call.id.clone(),
-                                    "name": func.name.clone(),
-                                    "arguments": func.arguments.clone()
-                                }));
-                            }
+                            let func = &call.function;
+                            content_parts.push(json!({
+                                "type": "tool_call",
+                                "id": call.id.clone(),
+                                "name": func.name.clone(),
+                                "arguments": func.arguments.clone()
+                            }));
                         }
                     }
 
@@ -1216,12 +1220,13 @@ impl OpenRouterProvider {
                     })?;
 
                     let mut tool_content = Vec::new();
-                    let content_text = msg.content.as_text();
-                    if !content_text.trim().is_empty() {
-                        tool_content.push(json!({
-                            "type": "output_text",
-                            "text": content_text
-                        }));
+                    if let Some(content_text) = msg.content.as_text() {
+                        if !content_text.trim().is_empty() {
+                            tool_content.push(json!({
+                                "type": "output_text",
+                                "text": content_text
+                            }));
+                        }
                     }
 
                     let mut tool_result = json!({
@@ -1261,10 +1266,11 @@ impl OpenRouterProvider {
         for msg in &request.messages {
             match msg.role {
                 MessageRole::System => {
-                    let content_text = msg.content.as_text();
-                    let trimmed = content_text.trim();
-                    if !trimmed.is_empty() {
-                        additional_guidance.push(trimmed.to_string());
+                    if let Some(content_text) = msg.content.as_text() {
+                        let trimmed = content_text.trim();
+                        if !trimmed.is_empty() {
+                            additional_guidance.push(trimmed.to_string());
+                        }
                     }
                 }
                 MessageRole::User => {
@@ -1287,14 +1293,13 @@ impl OpenRouterProvider {
 
                     if let Some(tool_calls) = &msg.tool_calls {
                         for call in tool_calls {
-                            if let Some(ref func) = call.function {
-                                content_parts.push(json!({
-                                    "type": "tool_call",
-                                    "id": call.id.clone(),
-                                    "name": func.name.clone(),
-                                    "arguments": func.arguments.clone()
-                                }));
-                            }
+                            let func = &call.function;
+                            content_parts.push(json!({
+                                "type": "tool_call",
+                                "id": call.id.clone(),
+                                "name": func.name.clone(),
+                                "arguments": func.arguments.clone()
+                            }));
                         }
                     }
 
@@ -1315,12 +1320,13 @@ impl OpenRouterProvider {
                     })?;
 
                     let mut tool_content = Vec::new();
-                    let content_text = msg.content.as_text();
-                    if !content_text.trim().is_empty() {
-                        tool_content.push(json!({
-                            "type": "output_text",
-                            "text": content_text
-                        }));
+                    if let Some(content_text) = msg.content.as_text() {
+                        if !content_text.trim().is_empty() {
+                            tool_content.push(json!({
+                                "type": "output_text",
+                                "text": content_text
+                            }));
+                        }
                     }
 
                     let mut tool_result = json!({
@@ -1395,12 +1401,13 @@ impl OpenRouterProvider {
                 let tools_json: Vec<Value> = tools
                     .iter()
                     .map(|tool| {
+                        let func = &tool.function;
                         json!({
                             "type": "function",
                             "function": {
-                                "name": tool.function.as_ref().unwrap().name,
-                                "description": tool.function.as_ref().unwrap().description,
-                                "parameters": tool.function.as_ref().unwrap().parameters
+                                "name": func.name,
+                                "description": func.description,
+                                "parameters": func.parameters
                             }
                         })
                     })
@@ -1458,16 +1465,15 @@ impl OpenRouterProvider {
                         let tool_calls_json: Vec<Value> = tool_calls
                             .iter()
                             .filter_map(|tc| {
-                                tc.function.as_ref().map(|func| {
-                                    json!({
-                                        "id": tc.id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": func.name,
-                                            "arguments": func.arguments
-                                        }
-                                    })
-                                })
+                                let func = &tc.function;
+                                Some(json!({
+                                    "id": tc.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": func.name,
+                                        "arguments": func.arguments
+                                    }
+                                }))
                             })
                             .collect();
                         message["tool_calls"] = Value::Array(tool_calls_json);
@@ -1515,12 +1521,13 @@ impl OpenRouterProvider {
                 let tools_json: Vec<Value> = tools
                     .iter()
                     .map(|tool| {
+                        let func = &tool.function;
                         json!({
                             "type": "function",
                             "function": {
-                                "name": tool.function.as_ref().unwrap().name,
-                                "description": tool.function.as_ref().unwrap().description,
-                                "parameters": tool.function.as_ref().unwrap().parameters
+                                "name": func.name,
+                                "description": func.description,
+                                "parameters": func.parameters
                             }
                         })
                     })
@@ -1669,12 +1676,15 @@ impl OpenRouterProvider {
 
             let usage = response_json.get("usage").map(parse_usage_value);
 
+            let content = content.unwrap_or_default();
+
             return Ok(LLMResponse {
                 content,
-                tool_calls,
+                model: self.model.clone(),
                 usage,
-                finish_reason,
                 reasoning,
+                tool_calls,
+                finish_reason,
                 reasoning_details,
             });
         }
@@ -1820,12 +1830,15 @@ impl OpenRouterProvider {
             .map(map_finish_reason)
             .unwrap_or(FinishReason::Stop);
 
+        let content = content.unwrap_or_default();
+
         Ok(LLMResponse {
             content,
-            tool_calls,
+            model: self.model.clone(),
             usage,
-            finish_reason,
             reasoning,
+            tool_calls,
+            finish_reason,
             reasoning_details,
         })
     }
@@ -1850,6 +1863,14 @@ impl LLMProvider for OpenRouterProvider {
         }
 
         true
+    }
+
+    fn supports_parallel_tool_config(&self, _model: &str) -> bool {
+        false
+    }
+
+    fn supports_structured_output(&self, _model: &str) -> bool {
+        false
     }
 
     fn supports_reasoning_effort(&self, model: &str) -> bool {
@@ -1888,6 +1909,7 @@ impl LLMProvider for OpenRouterProvider {
 
     async fn stream(&self, request: LLMRequest) -> Result<LLMStream, LLMError> {
         let response = self.send_with_tool_fallback(&request, Some(true)).await?;
+        let resolved_model = self.resolve_model(&request).to_string();
 
         let stream = try_stream! {
             let mut body_stream = response.bytes_stream();
@@ -1906,7 +1928,7 @@ impl LLMProvider for OpenRouterProvider {
                         "OpenRouter",
                         &format!("Streaming error: {}", err),
                     );
-                    LLMError::Network(formatted_error)
+                    LLMError::NetworkError(formatted_error)
                 })?;
 
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
@@ -1998,6 +2020,7 @@ impl LLMProvider for OpenRouterProvider {
                 usage,
                 finish_reason,
                 reasoning,
+                resolved_model.clone(),
             );
 
             yield LLMStreamEvent::Completed { response };
@@ -2068,7 +2091,7 @@ impl LLMClient for OpenRouterProvider {
         let response = LLMProvider::generate(self, request).await?;
 
         Ok(llm_types::LLMResponse {
-            content: response.content.unwrap_or_default(),
+            content: response.content,
             model: request_model,
             usage: response.usage.map(|u| llm_types::Usage {
                 prompt_tokens: u.prompt_tokens as usize,
@@ -2079,7 +2102,17 @@ impl LLMClient for OpenRouterProvider {
                 cache_read_tokens: u.cache_read_tokens.map(|v| v as usize),
             }),
             reasoning: response.reasoning,
+            tool_calls: response.tool_calls,
+            finish_reason: response.finish_reason,
+            reasoning_details: response.reasoning_details,
         })
+    }
+
+    async fn stream(
+        &self,
+        request: llm_types::LLMRequest,
+    ) -> Result<llm_types::LLMStream, LLMError> {
+        LLMProvider::stream(self, request).await
     }
 
     fn backend_kind(&self) -> llm_types::BackendKind {

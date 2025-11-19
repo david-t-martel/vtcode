@@ -5,7 +5,8 @@ use super::providers::{
 use crate::config::TimeoutsConfig;
 use crate::config::core::PromptCachingConfig;
 use crate::config::models::{ModelId, Provider};
-use crate::llm::provider::{LLMError, LLMProvider};
+use crate::llm::provider::LLMProvider;
+use crate::llm::types::LLMError;
 use std::collections::HashMap;
 use std::str::FromStr;
 

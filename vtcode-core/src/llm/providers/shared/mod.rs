@@ -1,6 +1,6 @@
 use crate::llm::error_display;
-use crate::llm::provider::{LLMError, ToolCall};
 use crate::llm::providers::{ReasoningBuffer, split_reasoning_from_text};
+use crate::llm::types::{LLMError, ToolCall};
 use serde_json::{Map, Value};
 
 #[derive(Debug, thiserror::Error)]

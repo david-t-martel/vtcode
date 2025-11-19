@@ -4,14 +4,14 @@ use crate::config::core::PromptCachingConfig;
 use crate::config::models::Provider as ModelProvider;
 use crate::llm::client::LLMClient;
 use crate::llm::error_display;
-use crate::llm::provider::{
-    FinishReason, LLMError, LLMProvider, LLMRequest, LLMResponse, Message, MessageRole, Usage,
-};
+use crate::llm::provider::{LLMProvider, LLMRequest, LLMStream, Message, MessageRole};
 use crate::llm::providers::common::{
     forward_prompt_cache_with_state, override_base_url, resolve_model,
 };
 use crate::llm::rig_adapter::reasoning_parameters_for;
 use crate::llm::types as llm_types;
+use crate::llm::types::{FinishReason, LLMError, LLMResponse, ToolCall, Usage};
+use async_stream::try_stream;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{Map, Value, json};
@@ -176,22 +176,21 @@ impl MoonshotProvider {
             );
 
             // Handle content as text
-            let content_value = Value::String(message.content.as_text());
+            let content_value =
+                Value::String(message.content.as_text().unwrap_or_default().to_string());
             message_map.insert("content".to_string(), content_value);
 
             if let Some(tool_calls) = &message.tool_calls {
                 let serialized_calls = tool_calls
                     .iter()
-                    .filter_map(|call| {
-                        call.function.as_ref().map(|func| {
-                            json!({
-                                "id": call.id.clone(),
-                                "type": "function",
-                                "function": {
-                                    "name": func.name.clone(),
-                                    "arguments": func.arguments.clone()
-                                }
-                            })
+                    .map(|call| {
+                        json!({
+                            "id": call.id.clone(),
+                            "type": "function",
+                            "function": {
+                                "name": call.function.name.clone(),
+                                "arguments": call.function.arguments.clone()
+                            }
                         })
                     })
                     .collect::<Vec<_>>();
@@ -260,7 +259,8 @@ impl MoonshotProvider {
                 ),
                 _ => None,
             })
-            .filter(|text| !text.is_empty());
+            .filter(|text| !text.is_empty())
+            .unwrap_or_default();
 
         let tool_calls = message
             .get("tool_calls")
@@ -269,34 +269,15 @@ impl MoonshotProvider {
                 calls
                     .iter()
                     .filter_map(|call| {
-                        // Parse tool call from Moonshot's format
-                        call.get("id")
-                            .and_then(|id_val| id_val.as_str())
-                            .and_then(|id| {
-                                call.get("function")
-                                    .and_then(|func_val| func_val.as_object())
-                                    .and_then(|func_obj| {
-                                        func_obj
-                                            .get("name")
-                                            .and_then(|name_val| name_val.as_str())
-                                            .and_then(|name| {
-                                                func_obj
-                                                    .get("arguments")
-                                                    .and_then(|args_val| args_val.as_str())
-                                                    .map(|args| crate::llm::provider::ToolCall {
-                                                        id: id.to_string(),
-                                                        function: Some(
-                                                            crate::llm::provider::FunctionCall {
-                                                                name: name.to_string(),
-                                                                arguments: args.to_string(),
-                                                            },
-                                                        ),
-                                                        call_type: "function".to_string(),
-                                                        text: None,
-                                                    })
-                                            })
-                                    })
-                            })
+                        let id = call.get("id")?.as_str()?;
+                        let func_obj = call.get("function")?.as_object()?;
+                        let name = func_obj.get("name")?.as_str()?;
+                        let args = func_obj.get("arguments")?.as_str()?;
+                        Some(ToolCall::function(
+                            id.to_string(),
+                            name.to_string(),
+                            args.to_string(),
+                        ))
                     })
                     .collect::<Vec<_>>()
             })
@@ -324,20 +305,20 @@ impl MoonshotProvider {
             prompt_tokens: usage_value
                 .get("prompt_tokens")
                 .and_then(|value| value.as_u64())
-                .unwrap_or(0) as u32,
+                .unwrap_or(0) as usize,
             completion_tokens: usage_value
                 .get("completion_tokens")
                 .and_then(|value| value.as_u64())
-                .unwrap_or(0) as u32,
+                .unwrap_or(0) as usize,
             total_tokens: usage_value
                 .get("total_tokens")
                 .and_then(|value| value.as_u64())
-                .unwrap_or(0) as u32,
+                .unwrap_or(0) as usize,
             cached_prompt_tokens: if self.prompt_cache_enabled {
                 usage_value
                     .get("prompt_cache_hit_tokens")
                     .and_then(|value| value.as_u64())
-                    .map(|value| value as u32)
+                    .map(|value| value as usize)
             } else {
                 None
             },
@@ -345,7 +326,7 @@ impl MoonshotProvider {
                 usage_value
                     .get("prompt_cache_miss_tokens")
                     .and_then(|value| value.as_u64())
-                    .map(|value| value as u32)
+                    .map(|value| value as usize)
             } else {
                 None
             },
@@ -354,6 +335,7 @@ impl MoonshotProvider {
 
         Ok(LLMResponse {
             content,
+            model: self.model.clone(),
             tool_calls,
             usage,
             finish_reason,
@@ -391,6 +373,22 @@ impl LLMProvider for MoonshotProvider {
             || requested == models::moonshot::KIMI_K2_THINKING_TURBO
     }
 
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn supports_parallel_tool_config(&self, _model: &str) -> bool {
+        false
+    }
+
+    fn supports_tools(&self, _model: &str) -> bool {
+        true
+    }
+
+    fn supports_structured_output(&self, _model: &str) -> bool {
+        false
+    }
+
     async fn generate(&self, mut request: LLMRequest) -> Result<LLMResponse, LLMError> {
         if request.model.trim().is_empty() {
             request.model = self.model.clone();
@@ -412,7 +410,7 @@ impl LLMProvider for MoonshotProvider {
                     PROVIDER_NAME,
                     &format!("Network error: {}", e),
                 );
-                LLMError::Network(formatted_error)
+                LLMError::NetworkError(formatted_error)
             })?;
 
         if !response.status().is_success() {
@@ -447,6 +445,14 @@ impl LLMProvider for MoonshotProvider {
         })?;
 
         self.parse_response(response_json)
+    }
+
+    async fn stream(&self, request: LLMRequest) -> Result<LLMStream, LLMError> {
+        let response = self.generate(request).await?;
+        let stream = try_stream! {
+            yield llm_types::LLMStreamEvent::Completed { response };
+        };
+        Ok(Box::pin(stream))
     }
 
     fn supported_models(&self) -> Vec<String> {
@@ -513,7 +519,7 @@ impl LLMClient for MoonshotProvider {
 
         let response = <MoonshotProvider as LLMProvider>::generate(self, request).await?;
         Ok(llm_types::LLMResponse {
-            content: response.content.unwrap_or_else(|| String::new()),
+            content: response.content,
             model: self.model.clone(),
             usage: response.usage.map(|u| llm_types::Usage {
                 prompt_tokens: u.prompt_tokens as usize,
@@ -524,7 +530,17 @@ impl LLMClient for MoonshotProvider {
                 cache_read_tokens: u.cache_read_tokens.map(|x| x as usize),
             }),
             reasoning: response.reasoning,
+            tool_calls: response.tool_calls,
+            finish_reason: response.finish_reason,
+            reasoning_details: response.reasoning_details,
         })
+    }
+
+    async fn stream(
+        &self,
+        request: llm_types::LLMRequest,
+    ) -> Result<llm_types::LLMStream, LLMError> {
+        LLMProvider::stream(self, request).await
     }
 
     fn backend_kind(&self) -> llm_types::BackendKind {

@@ -674,6 +674,7 @@ pub(crate) async fn stream_and_render_response(
     let mut emitted_tokens = false;
     let mut reasoning_state = StreamingReasoningState::new(supports_streaming_markdown);
     let mut spinner_message_updated = false;
+    let mut streaming_state_set = false;
 
     // Track streaming progress
     let mut token_count = 0;
@@ -714,6 +715,12 @@ pub(crate) async fn stream_and_render_response(
 
         match event_result {
             Ok(LLMStreamEvent::Token { delta }) => {
+                if !streaming_state_set {
+                    renderer
+                        .handle()
+                        .set_agent_state(vtcode_core::ui::state::AgentState::Streaming);
+                    streaming_state_set = true;
+                }
                 token_count += 1;
                 if !spinner_message_updated {
                     spinner.update_message("Receiving response...");
